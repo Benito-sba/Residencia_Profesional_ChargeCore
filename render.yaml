@@ -2,6 +2,7 @@ services:
   - type: web
     name: chargecore-backend
     runtime: python
+    plan: free
     rootDir: backend
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
@@ -23,6 +24,7 @@ services:
   - type: web
     name: chargecore-frontend
     runtime: python
+    plan: free
     rootDir: frontend
     buildCommand: pip install -r requirements.txt
     startCommand: streamlit run app.py --server.address 0.0.0.0 --server.port $PORT --server.headless true
