@@ -1,0 +1,16 @@
+fastapi==0.111.0
+uvicorn[standard]==0.30.0
+motor==3.7.0
+pymongo==4.11.0
+supabase==2.32.0
+pydantic==2.11.7
+pydantic-settings==2.2.0
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+ocpp==0.26.0
+websockets==13.1
+python-multipart==0.0.9
+email-validator==2.1.0
+openpyxl==3.1.2
+reportlab==4.2.2

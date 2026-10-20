@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: chargecore-backend
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.10
+      - key: SECRET_KEY
+        generateValue: true
+      - key: MONGODB_URI
+        value: mongodb+srv://santiagobaacevedi425_db_user:0ZpQm6sMgpZbA22a@csms-crode.gn4ofsn.mongodb.net/csms_crode?retryWrites=true&w=majority
+      - key: DATABASE_NAME
+        value: csms_crode
+      - key: DEBUG
+        value: "false"
+      - key: OCPP_COMMAND_TIMEOUT_SECONDS
+        value: "30"
+
+  - type: web
+    name: chargecore-frontend
+    runtime: python
+    rootDir: frontend
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.address 0.0.0.0 --server.port $PORT --server.headless true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.10
+      - key: CHARGECORE_API_URL
+        fromService:
+          type: web
+          name: chargecore-backend
+          envVarKey: RENDER_EXTERNAL_URL
