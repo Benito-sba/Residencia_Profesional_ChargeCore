@@ -12,7 +12,7 @@ services:
         value: 3.12.10
       - key: SECRET_KEY
         generateValue: true
-      - key: MONGODB_URI
+      - key: MONGODB_URL
         value: mongodb+srv://santiagobaacevedi425_db_user:0ZpQm6sMgpZbA22a@csms-crode.gn4ofsn.mongodb.net/csms_crode?retryWrites=true&w=majority
       - key: DATABASE_NAME
         value: csms_crode
