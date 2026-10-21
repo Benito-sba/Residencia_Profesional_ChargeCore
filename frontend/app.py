@@ -12,6 +12,20 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
+st.markdown("""
+    <style>
+    [data-testid="stAppSkeleton"],
+    [data-testid="stSkeleton"],
+    div[data-testid="stSkeleton"],
+    [data-testid="stSkeleton"] > *,
+    .stSkeleton {
+        display: none !important;
+        visibility: hidden !important;
+        height: 0px !important;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
 init_session_state()
 
 # Aplicar estilos personalizados
