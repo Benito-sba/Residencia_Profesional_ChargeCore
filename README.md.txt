@@ -179,6 +179,12 @@ el registro de conexiones WebSocket del cargador vive en memoria del proceso.
 No escale horizontalmente ni inicie workers adicionales sin mover ese estado a
 un mecanismo compartido.
 
+El frontend requiere versiones compatibles de NumPy, pandas y PyArrow, que
+están fijadas en `frontend/requirements.txt`. Si Render muestra errores como
+`pyarrow requires NumPy 2.0 or newer` o indica que falta PyArrow, publica el
+cambio más reciente del repositorio y vuelve a desplegar el servicio
+`chargecore-frontend`; Render instala estas dependencias durante su compilación.
+
 1. Sube el proyecto a un repositorio Git y, en Render, crea un **Blueprint**
    desde ese repositorio usando `render.yaml`.
 2. Cuando Render lo solicite, proporciona `MONGODB_URL` con la URI de una

@@ -27,6 +27,9 @@ st.set_page_config(
 def apply_dashboard_style():
     st.markdown("""
     <style>
+    div[data-testid="stSkeleton"] {
+        display: none !important;
+    }
     .main {
         background-color: #f8fafc;
     }
