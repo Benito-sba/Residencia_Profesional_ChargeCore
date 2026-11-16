@@ -72,6 +72,12 @@ class CompanyNFCIsolationTests(unittest.IsolatedAsyncioTestCase):
             {"_id": ObjectId(), "uid": "CARD-A", "empresa_id": company_a},
             {"_id": ObjectId(), "uid": "CARD-B", "empresa_id": company_b},
             {"_id": ObjectId(), "uid": "CARD-OLD"},
+            {
+                "_id": ObjectId(),
+                "uid": "CARD-ARCHIVED",
+                "empresa_id": company_a,
+                "archivado": True,
+            },
         ])
 
         with patch.object(nfc_cards, "get_collection", return_value=cards):
@@ -82,6 +88,7 @@ class CompanyNFCIsolationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([card["uid"] for card in result], ["CARD-A"])
         self.assertEqual(cards.find_queries[0]["empresa_id"], company_a)
+        self.assertEqual(cards.find_queries[0]["archivado"], {"$ne": True})
 
     async def test_owner_cannot_assign_card_to_client_from_another_company(self):
         company_a = ObjectId()

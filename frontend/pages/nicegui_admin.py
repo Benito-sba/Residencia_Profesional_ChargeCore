@@ -918,6 +918,77 @@ def _edit_record_callback(page_key, record, token, api_base_url):
     return open_edit_dialog
 
 
+def _confirm_smart_delete(page_key, record, token, api_base_url):
+    record_id = record.get("_id") or record.get("id")
+    if not record_id:
+        ui.notify("El registro no tiene identificador.", type="negative")
+        return
+
+    endpoints = {
+        "usuarios": f"/usuarios/{record_id}",
+        "vehiculos": f"/vehiculos/{record_id}",
+        "tarjetas": f"/nfc-cards/{record_id}",
+    }
+    if page_key not in endpoints:
+        ui.notify("No se puede eliminar este tipo de registro.", type="negative")
+        return
+
+    record_label = {
+        "usuarios": "la cuenta y sus vehículos y tarjetas asociados",
+        "vehiculos": "el vehículo",
+        "tarjetas": "la tarjeta NFC",
+    }[page_key]
+    with ui.dialog() as dialog, ui.card().classes(
+        "chargecore-card w-full max-w-md gap-4 p-6"
+    ):
+        ui.label("Confirmar eliminación").classes("text-xl font-bold text-white")
+        ui.label(
+            f"Se revisará el historial de {record_label}. "
+            "Si tiene cargas, referencias históricas o una relación protegida, "
+            "se conservará para reportes y se desactivará; si no, se eliminará "
+            "permanentemente."
+        ).classes("text-sm text-slate-300")
+        command_lock = Lock()
+
+        def confirm_delete():
+            if not command_lock.acquire(blocking=False):
+                return
+            delete_button.disable()
+            try:
+                result = api_delete(
+                    endpoints[page_key],
+                    token=token,
+                    base_url=api_base_url,
+                )
+                success_message = (
+                    result.get("mensaje")
+                    if isinstance(result, dict)
+                    else None
+                ) or "El registro se eliminó de forma segura."
+                if _notify_result(result, success_message):
+                    dialog.close()
+            finally:
+                delete_button.enable()
+                command_lock.release()
+
+        with ui.row().classes("w-full justify-end gap-2"):
+            ui.button("Cancelar", on_click=dialog.close).props("flat no-caps")
+            delete_button = ui.button(
+                "Confirmar eliminación",
+                icon="delete",
+                on_click=confirm_delete,
+            ).props("no-caps color=negative")
+    dialog.open()
+
+
+def _delete_record_callback(page_key, record, token, api_base_url):
+    def open_delete_dialog():
+        with context.client.layout:
+            _confirm_smart_delete(page_key, record, token, api_base_url)
+
+    return open_delete_dialog
+
+
 def _deactivate_record(page_key, record, token, api_base_url):
     record_id = record.get("_id") or record.get("id")
     if page_key == "cargadores":
@@ -928,13 +999,15 @@ def _deactivate_record(page_key, record, token, api_base_url):
             base_url=api_base_url,
         )
     else:
-        endpoint = {
-            "usuarios": "/usuarios/",
-            "vehiculos": "/vehiculos/",
-            "tarjetas": "/nfc-cards/",
-        }[page_key]
-        result = api_delete(
+        endpoints = {
+            "usuarios": ("/usuarios/", {"activo": False}),
+            "vehiculos": ("/vehiculos/", {"activo": False}),
+            "tarjetas": ("/nfc-cards/", {"estado": "bloqueada"}),
+        }
+        endpoint, payload = endpoints[page_key]
+        result = api_put(
             f"{endpoint}{record_id}",
+            json=payload,
             token=token,
             base_url=api_base_url,
         )
@@ -2158,9 +2231,9 @@ def _render_users_records(rows, token, api_base_url):
                                             ui.separator()
                                             ui.menu_item(
                                                 "Eliminar",
-                                                on_click=lambda selected=record: _deactivate_record(
+                                                on_click=_delete_record_callback(
                                                     "usuarios",
-                                                    selected,
+                                                    record,
                                                     token,
                                                     api_base_url,
                                                 ),
@@ -2707,6 +2780,15 @@ def _render_registry_records(page_key, rows, token, api_base_url):
                                                 on_click=lambda selected=record: _deactivate_record(
                                                     page_key,
                                                     selected,
+                                                    token,
+                                                    api_base_url,
+                                                ),
+                                            )
+                                            ui.menu_item(
+                                                "Eliminar",
+                                                on_click=_delete_record_callback(
+                                                    page_key,
+                                                    record,
                                                     token,
                                                     api_base_url,
                                                 ),

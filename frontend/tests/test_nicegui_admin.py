@@ -36,6 +36,79 @@ class NiceGuiAdminTests(unittest.TestCase):
             ["usuarios", "vehiculos", "tarjetas"],
         )
 
+    def test_delete_confirmation_opens_in_page_layout_and_waits_for_confirm(self):
+        record = {"_id": "vehicle-1"}
+        layout = MagicMock()
+        client = SimpleNamespace(layout=layout)
+        dialog = MagicMock()
+        dialog_context = MagicMock()
+        dialog_context.__enter__.return_value = dialog
+        dialog_context.__exit__.return_value = False
+        cancel_button = MagicMock()
+        confirm_button = MagicMock()
+        buttons = Mock(side_effect=[cancel_button, confirm_button])
+        api_delete = Mock(return_value={"mensaje": "Vehículo eliminado"})
+
+        with (
+            patch.object(
+                type(nicegui_admin.context),
+                "client",
+                new_callable=PropertyMock,
+                return_value=client,
+            ),
+            patch.object(
+                nicegui_admin.ui,
+                "dialog",
+                return_value=dialog_context,
+            ),
+            patch.object(nicegui_admin.ui, "card"),
+            patch.object(nicegui_admin.ui, "label"),
+            patch.object(nicegui_admin.ui, "row"),
+            patch.object(nicegui_admin.ui, "button", buttons),
+            patch.object(nicegui_admin, "api_delete", api_delete),
+            patch.object(nicegui_admin, "_notify_result", return_value=True),
+        ):
+            callback = nicegui_admin._delete_record_callback(
+                "vehiculos",
+                record,
+                "token",
+                "http://api.test/api",
+            )
+            callback()
+
+            api_delete.assert_not_called()
+            buttons.call_args_list[1].kwargs["on_click"]()
+
+        self.assertEqual(layout.__enter__.call_count, 1)
+        api_delete.assert_called_once_with(
+            "/vehiculos/vehicle-1",
+            token="token",
+            base_url="http://api.test/api",
+        )
+
+    def test_deactivation_actions_do_not_call_smart_delete_endpoints(self):
+        cases = (
+            ("usuarios", "/usuarios/user-1", {"activo": False}),
+            ("vehiculos", "/vehiculos/vehicle-1", {"activo": False}),
+            ("tarjetas", "/nfc-cards/card-1", {"estado": "bloqueada"}),
+        )
+        with (
+            patch.object(nicegui_admin, "api_put") as api_put,
+            patch.object(nicegui_admin, "api_delete") as api_delete,
+            patch.object(nicegui_admin, "_notify_result"),
+        ):
+            for page_key, endpoint, payload in cases:
+                nicegui_admin._deactivate_record(
+                    page_key,
+                    {"_id": endpoint.rsplit("/", 1)[1]},
+                    "token",
+                    "http://api.test/api",
+                )
+                self.assertEqual(api_put.call_args.args[0], endpoint)
+                self.assertEqual(api_put.call_args.kwargs["json"], payload)
+
+        api_delete.assert_not_called()
+
     def test_company_search_matches_name_and_contact_fields(self):
         companies = [
             {

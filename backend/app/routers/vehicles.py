@@ -1,7 +1,11 @@
+from datetime import datetime
+
 from fastapi import APIRouter, HTTPException, status, Depends
-from app.database import get_collection
+from pymongo.errors import PyMongoError
+from app.database import get_collection, get_database
 from app.auth import company_scoped_query, require_company_member
 from app.models.vehicle import VehiculoCreate, VehiculoUpdate
+from app.services.safe_deletion import has_vehicle_history
 from app.validation import parse_object_id
 
 router = APIRouter(prefix="/api/vehiculos", tags=["Vehículos"])
@@ -36,7 +40,10 @@ async def _company_client(user_id, current_user):
 
 @router.get("/")
 async def list_vehicles(current_user=Depends(require_company_member)):
-    query = company_scoped_query(current_user, {"activo": True})
+    query = company_scoped_query(
+        current_user,
+        {"activo": True, "archivado": {"$ne": True}},
+    )
     if current_user.get("rol") == "cliente":
         query["usuario_id"] = current_user["_id"]
     cursor = get_collection("vehiculos").find(query)
@@ -100,7 +107,10 @@ async def update_vehicle(
     update_data = {k: v for k, v in vehicle.model_dump().items() if v is not None}
     query = company_scoped_query(
         current_user,
-        {"_id": parse_object_id(vehicle_id, "vehiculo")},
+        {
+            "_id": parse_object_id(vehicle_id, "vehiculo"),
+            "archivado": {"$ne": True},
+        },
     )
     if current_user.get("rol") == "cliente":
         query["usuario_id"] = current_user["_id"]
@@ -114,16 +124,60 @@ async def update_vehicle(
 
 @router.delete("/{vehicle_id}")
 async def delete_vehicle(vehicle_id: str, current_user=Depends(require_company_member)):
-    query = company_scoped_query(
-        current_user,
-        {"_id": parse_object_id(vehicle_id, "vehiculo")},
-    )
+    object_id = parse_object_id(vehicle_id, "vehiculo")
+    query = company_scoped_query(current_user, {"_id": object_id})
     if current_user.get("rol") == "cliente":
         query["usuario_id"] = current_user["_id"]
-    result = await get_collection("vehiculos").update_one(
-        query,
-        {"$set": {"activo": False}}
-    )
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Vehículo no encontrado")
-    return {"mensaje": "Vehículo desactivado"}
+    vehicles = get_collection("vehiculos")
+    try:
+        async with await get_database().client.start_session() as session:
+            async with session.start_transaction():
+                existing = await vehicles.find_one(query, session=session)
+                if existing is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Vehículo no encontrado",
+                    )
+                if existing.get("archivado"):
+                    return {"mensaje": "El vehículo ya estaba archivado"}
+                if await has_vehicle_history(
+                    object_id,
+                    get_collection,
+                    session=session,
+                ):
+                    await vehicles.update_one(
+                        query,
+                        {"$set": {
+                            "activo": False,
+                            "archivado": True,
+                            "fecha_baja": datetime.utcnow(),
+                        }},
+                        session=session,
+                    )
+                    return {
+                        "mensaje": (
+                            "Vehículo archivado; historial conservado para reportes"
+                        )
+                    }
+                result = await vehicles.delete_one(query, session=session)
+                if result.deleted_count != 1:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Vehículo no encontrado",
+                    )
+                return {"mensaje": "Vehículo eliminado permanentemente"}
+    except PyMongoError as exc:
+        if exc.has_error_label("TransientTransactionError"):
+            raise HTTPException(
+                status_code=409,
+                detail="Hay otra eliminación en curso; vuelve a intentarlo",
+            ) from exc
+        if exc.has_error_label("UnknownTransactionCommitResult"):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "No se pudo confirmar con certeza la eliminación; "
+                    "verifica el registro antes de repetirla"
+                ),
+            ) from exc
+        raise

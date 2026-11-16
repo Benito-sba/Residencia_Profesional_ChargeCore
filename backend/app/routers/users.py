@@ -10,6 +10,7 @@ from app.auth import (
 )
 from app.models.user import UsuarioCreate, UsuarioUpdate
 from app.services.reward_service import get_finalized_session_count
+from app.services.safe_deletion import has_user_history
 from app.validation import parse_object_id
 
 router = APIRouter(prefix="/api/usuarios", tags=["Usuarios"])
@@ -99,7 +100,10 @@ async def list_users(
 ):
     cursor = (
         get_collection("usuarios")
-        .find(_user_scope(current_user))
+        .find({
+            **_user_scope(current_user),
+            "archivado": {"$ne": True},
+        })
         .skip(skip)
         .limit(limit)
     )
@@ -226,6 +230,11 @@ async def update_user(
     existing = await users.find_one(target_query)
     if existing is None:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    if existing.get("archivado"):
+        raise HTTPException(
+            status_code=409,
+            detail="No se puede modificar un usuario archivado",
+        )
 
     next_role = update_data.get("rol", existing.get("rol"))
     if is_superadmin:
@@ -408,24 +417,171 @@ async def delete_user(
             status_code=409,
             detail="No se puede desactivar al último superadministrador activo",
         )
-    is_active_company_owner = (
-        existing.get("rol") == "dueno_empresa"
-        and existing.get("activo", True)
-    )
+    try:
+        async with await get_database().client.start_session() as session:
+            async with session.start_transaction():
+                existing = await users.find_one(target_query, session=session)
+                if existing is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Usuario no encontrado",
+                    )
+                if existing.get("archivado"):
+                    return {"mensaje": "El usuario ya estaba archivado"}
 
-    update_data = {"activo": False, "fecha_baja": datetime.utcnow()}
-    if is_active_company_owner:
-        result = await _update_company_owner_atomically(
-            users,
-            target_query,
-            existing.get("empresa_id"),
-            update_data,
-        )
-    else:
-        result = await users.update_one(
-            {**target_query, "activo": {"$ne": False}},
-            {"$set": update_data},
-        )
-    if result.matched_count == 0:
-        return {"mensaje": "El usuario ya estaba desactivado"}
-    return {"mensaje": "Usuario desactivado; historial conservado"}
+                if (
+                    existing.get("rol") == "admin"
+                    and existing.get("activo", True)
+                    and await users.count_documents(
+                        {
+                            "rol": "admin",
+                            "activo": {"$ne": False},
+                        },
+                        session=session,
+                    ) <= 1
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="No se puede eliminar al último administrador activo",
+                    )
+                if (
+                    existing.get("rol") == "superadmin"
+                    and existing.get("activo", True)
+                    and await users.count_documents(
+                        {
+                            "rol": "superadmin",
+                            "activo": {"$ne": False},
+                        },
+                        session=session,
+                    ) <= 1
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="No se puede desactivar al último superadministrador activo",
+                    )
+
+                user_has_history = (
+                    False
+                    if existing.get("rol") == "dueno_empresa"
+                    else await has_user_history(
+                        existing,
+                        get_collection,
+                        session=session,
+                    )
+                )
+                is_active_company_owner = (
+                    existing.get("rol") == "dueno_empresa"
+                    and existing.get("activo", True)
+                )
+                if user_has_history or existing.get("rol") == "dueno_empresa":
+                    update_data = {
+                        "activo": False,
+                        "archivado": True,
+                        "fecha_baja": datetime.utcnow(),
+                    }
+                    if is_active_company_owner:
+                        company_id = existing.get("empresa_id")
+                        if company_id is None:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="No se puede archivar al dueño sin una empresa válida",
+                            )
+                        company_result = await get_collection("empresas").update_one(
+                            {"_id": company_id},
+                            {"$inc": {"owner_change_version": 1}},
+                            session=session,
+                        )
+                        if company_result.matched_count == 0:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="No se puede archivar al dueño sin una empresa válida",
+                            )
+                        active_owners = await users.count_documents(
+                            {
+                                "rol": "dueno_empresa",
+                                "empresa_id": company_id,
+                                "activo": {"$ne": False},
+                            },
+                            session=session,
+                        )
+                        if active_owners <= 1:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="No se puede desactivar al último dueño activo de la empresa",
+                            )
+
+                    result = await users.update_one(
+                        target_query,
+                        {"$set": update_data},
+                        session=session,
+                    )
+                    if result.matched_count == 0:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="La cuenta cambió durante la operación",
+                        )
+                    await get_collection("vehiculos").update_many(
+                        {"usuario_id": object_id},
+                        {"$set": {
+                            "activo": False,
+                            "archivado": True,
+                            "fecha_baja": update_data["fecha_baja"],
+                        }},
+                        session=session,
+                    )
+                    await get_collection("nfc_cards").update_many(
+                        {"usuario_id": object_id},
+                        {"$set": {
+                            "estado": "bloqueada",
+                            "archivado": True,
+                            "fecha_baja": update_data["fecha_baja"],
+                        }},
+                        session=session,
+                    )
+                    return {
+                        "mensaje": (
+                            "Usuario archivado y desactivado; "
+                            "historial conservado para reportes"
+                            if user_has_history
+                            else (
+                                "Usuario archivado y desactivado; "
+                                "relación empresarial conservada"
+                            )
+                        )
+                    }
+
+                await get_collection("vehiculos").delete_many(
+                    {"usuario_id": object_id},
+                    session=session,
+                )
+                await get_collection("nfc_cards").delete_many(
+                    {"usuario_id": object_id},
+                    session=session,
+                )
+                result = await users.delete_one(target_query, session=session)
+                if result.deleted_count != 1:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Usuario no encontrado",
+                    )
+                return {
+                    "mensaje": (
+                        "Usuario eliminado permanentemente junto con sus "
+                        "vehículos y tarjetas sin historial"
+                    )
+                }
+    except PyMongoError as exc:
+        if exc.has_error_label("TransientTransactionError"):
+            raise HTTPException(
+                status_code=409,
+                detail="Hay otra eliminación en curso; vuelve a intentarlo",
+            ) from exc
+        if exc.has_error_label("UnknownTransactionCommitResult"):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "No se pudo confirmar con certeza la eliminación; "
+                    "verifica el registro antes de repetirla"
+                ),
+            ) from exc
+        raise

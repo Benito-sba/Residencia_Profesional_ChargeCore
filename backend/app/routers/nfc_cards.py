@@ -1,10 +1,11 @@
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, status, Depends
-from pymongo.errors import DuplicateKeyError
-from app.database import get_collection
+from pymongo.errors import DuplicateKeyError, PyMongoError
+from app.database import get_collection, get_database
 from app.auth import company_scoped_query, require_company_admin_access
 from app.models.nfc_card import NFCCardCreate, NFCCardUpdate
+from app.services.safe_deletion import has_nfc_card_history
 from app.validation import parse_object_id
 
 router = APIRouter(prefix="/api/nfc-cards", tags=["Tarjetas NFC"])
@@ -36,7 +37,9 @@ async def _require_active_client(user_id, current_user):
 
 @router.get("/")
 async def list_nfc_cards(current_user=Depends(require_company_admin_access)):
-    cursor = get_collection("nfc_cards").find(company_scoped_query(current_user))
+    cursor = get_collection("nfc_cards").find(
+        company_scoped_query(current_user, {"archivado": {"$ne": True}})
+    )
     cards = []
     async for c in cursor:
         c["_id"] = str(c["_id"])
@@ -55,7 +58,13 @@ async def get_user_cards(
     target_user_id = parse_object_id(user_id, "usuario")
     await _require_active_client(target_user_id, current_user)
     cursor = get_collection("nfc_cards").find(
-        company_scoped_query(current_user, {"usuario_id": target_user_id})
+        company_scoped_query(
+            current_user,
+            {
+                "usuario_id": target_user_id,
+                "archivado": {"$ne": True},
+            },
+        )
     )
     cards = []
     async for c in cursor:
@@ -95,10 +104,15 @@ async def update_nfc_card(
     update_data = card.model_dump(exclude_none=True)
     if not update_data:
         raise HTTPException(status_code=422, detail="No hay datos para actualizar")
+    if update_data.get("estado") == "bloqueada":
+        update_data.setdefault("fecha_baja", datetime.utcnow())
 
     cards = get_collection("nfc_cards")
     object_id = parse_object_id(card_id, "tarjeta NFC")
-    card_filter = company_scoped_query(current_user, {"_id": object_id})
+    card_filter = company_scoped_query(
+        current_user,
+        {"_id": object_id, "archivado": {"$ne": True}},
+    )
     if await cards.find_one(card_filter) is None:
         raise HTTPException(status_code=404, detail="Tarjeta no encontrada")
 
@@ -122,18 +136,57 @@ async def delete_nfc_card(
     cards = get_collection("nfc_cards")
     object_id = parse_object_id(card_id, "tarjeta NFC")
     card_filter = company_scoped_query(current_user, {"_id": object_id})
-    existing = await cards.find_one(card_filter)
-    if existing is None:
-        raise HTTPException(status_code=404, detail="Tarjeta no encontrada")
+    try:
+        async with await get_database().client.start_session() as session:
+            async with session.start_transaction():
+                existing = await cards.find_one(card_filter, session=session)
+                if existing is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Tarjeta no encontrada",
+                    )
+                if existing.get("archivado"):
+                    return {"mensaje": "La tarjeta ya estaba archivada"}
 
-    if existing.get("estado") == "bloqueada":
-        return {"mensaje": "La tarjeta ya estaba bloqueada; historial conservado"}
-
-    await cards.update_one(
-        card_filter,
-        {"$set": {
-            "estado": "bloqueada",
-            "fecha_baja": datetime.utcnow(),
-        }},
-    )
-    return {"mensaje": "Tarjeta bloqueada; historial conservado"}
+                if await has_nfc_card_history(
+                    existing,
+                    get_collection,
+                    session=session,
+                ):
+                    await cards.update_one(
+                        card_filter,
+                        {"$set": {
+                            "estado": "bloqueada",
+                            "archivado": True,
+                            "fecha_baja": datetime.utcnow(),
+                        }},
+                        session=session,
+                    )
+                    return {
+                        "mensaje": (
+                            "Tarjeta archivada y bloqueada; "
+                            "historial conservado para reportes"
+                        )
+                    }
+                result = await cards.delete_one(card_filter, session=session)
+                if result.deleted_count != 1:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Tarjeta no encontrada",
+                    )
+                return {"mensaje": "Tarjeta eliminada permanentemente"}
+    except PyMongoError as exc:
+        if exc.has_error_label("TransientTransactionError"):
+            raise HTTPException(
+                status_code=409,
+                detail="Hay otra eliminación en curso; vuelve a intentarlo",
+            ) from exc
+        if exc.has_error_label("UnknownTransactionCommitResult"):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "No se pudo confirmar con certeza la eliminación; "
+                    "verifica el registro antes de repetirla"
+                ),
+            ) from exc
+        raise

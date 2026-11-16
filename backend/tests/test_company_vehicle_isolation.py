@@ -109,6 +109,13 @@ class CompanyVehicleIsolationTests(unittest.IsolatedAsyncioTestCase):
                     "usuario_id": self.user_a,
                     "activo": True,
                 },
+                {
+                    "_id": ObjectId(),
+                    "usuario_id": self.user_a,
+                    "empresa_id": self.company_a,
+                    "activo": True,
+                    "archivado": True,
+                },
             ]),
         }
         self.patcher = patch.object(

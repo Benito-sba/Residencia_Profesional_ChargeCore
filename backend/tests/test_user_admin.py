@@ -34,14 +34,14 @@ class FakeUsersCollection:
     def __init__(self, documents):
         self.documents = documents
 
-    def find(self, query):
+    def find(self, query, projection=None, **kwargs):
         return FakeUsersCursor([
             document.copy()
             for document in self.documents
             if self._matches(document, query)
         ])
 
-    async def find_one(self, query):
+    async def find_one(self, query, **kwargs):
         for document in self.documents:
             if self._matches(document, query):
                 return document.copy()
@@ -62,12 +62,31 @@ class FakeUsersCollection:
                 return SimpleNamespace(matched_count=1)
         return SimpleNamespace(matched_count=0)
 
-    async def delete_one(self, query):
+    async def delete_one(self, query, **kwargs):
         for index, document in enumerate(self.documents):
             if self._matches(document, query):
                 self.documents.pop(index)
                 return SimpleNamespace(deleted_count=1)
         return SimpleNamespace(deleted_count=0)
+
+    async def delete_many(self, query, **kwargs):
+        matching = [
+            document for document in self.documents
+            if self._matches(document, query)
+        ]
+        self.documents[:] = [
+            document for document in self.documents
+            if not self._matches(document, query)
+        ]
+        return SimpleNamespace(deleted_count=len(matching))
+
+    async def update_many(self, query, update, **kwargs):
+        matched = 0
+        for document in self.documents:
+            if self._matches(document, query):
+                document.update(update.get("$set", {}))
+                matched += 1
+        return SimpleNamespace(matched_count=matched)
 
     @classmethod
     def _matches(cls, document, query):
@@ -76,7 +95,11 @@ class FakeUsersCollection:
             if isinstance(expected, dict):
                 if "$ne" in expected and actual == expected["$ne"]:
                     return False
+                if "$in" in expected and actual not in expected["$in"]:
+                    return False
                 if "$ne" in expected:
+                    continue
+                if "$in" in expected:
                     continue
             elif actual != expected:
                 return False
@@ -392,7 +415,7 @@ class UserAdministratorSafetyTests(unittest.IsolatedAsyncioTestCase):
             return {
                 "usuarios": collection,
                 "empresas": company_collection,
-            }[name]
+            }.get(name, FakeUsersCollection([]))
 
         with patch.object(users, "get_collection", side_effect=get_collection):
             owner_result = await users.update_user(
@@ -525,7 +548,14 @@ class UserAdministratorSafetyTests(unittest.IsolatedAsyncioTestCase):
             {"_id": ObjectId(), "rol": "superadmin", "activo": True},
         ])
 
-        with patch.object(users, "get_collection", return_value=collection):
+        with (
+            patch.object(users, "get_collection", return_value=collection),
+            patch.object(
+                users,
+                "get_database",
+                return_value=SimpleNamespace(client=FakeMongoClient()),
+            ),
+        ):
             result = await users.delete_user(
                 str(first_id),
                 current_user={"rol": "superadmin"},
@@ -533,7 +563,7 @@ class UserAdministratorSafetyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             result["mensaje"],
-            "Usuario desactivado; historial conservado",
+            "Usuario archivado y desactivado; historial conservado para reportes",
         )
         self.assertFalse(collection.documents[0]["activo"])
 
@@ -555,7 +585,7 @@ class UserAdministratorSafetyTests(unittest.IsolatedAsyncioTestCase):
                     return {
                         "usuarios": collection,
                         "empresas": company_collection,
-                    }[name]
+                    }.get(name, FakeUsersCollection([]))
 
                 with (
                     patch.object(users, "get_collection", side_effect=get_collection),
@@ -611,7 +641,7 @@ class UserAdministratorSafetyTests(unittest.IsolatedAsyncioTestCase):
             return {
                 "usuarios": collection,
                 "empresas": company_collection,
-            }[name]
+            }.get(name, FakeUsersCollection([]))
 
         with (
             patch.object(users, "get_collection", side_effect=get_collection),
@@ -628,7 +658,7 @@ class UserAdministratorSafetyTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             result["mensaje"],
-            "Usuario desactivado; historial conservado",
+            "Usuario archivado y desactivado; relación empresarial conservada",
         )
         self.assertFalse(collection.documents[0]["activo"])
 
@@ -652,7 +682,7 @@ class UserAdministratorSafetyTests(unittest.IsolatedAsyncioTestCase):
             return {
                 "usuarios": collection,
                 "empresas": company_collection,
-            }[name]
+            }.get(name, FakeUsersCollection([]))
 
         with (
             patch.object(users, "get_collection", side_effect=get_collection),
@@ -697,7 +727,7 @@ class UserAdministratorSafetyTests(unittest.IsolatedAsyncioTestCase):
             return {
                 "usuarios": collection,
                 "empresas": company_collection,
-            }[name]
+            }.get(name, FakeUsersCollection([]))
 
         with (
             patch.object(users, "get_collection", side_effect=get_collection),
@@ -827,15 +857,23 @@ class UserAdministratorSafetyTests(unittest.IsolatedAsyncioTestCase):
             "total_cargas": 7,
         }])
 
-        with patch.object(users, "get_collection", return_value=collection):
+        with (
+            patch.object(users, "get_collection", return_value=collection),
+            patch.object(
+                users,
+                "get_database",
+                return_value=SimpleNamespace(client=FakeMongoClient()),
+            ),
+        ):
             result = await users.delete_user(str(user_id), current_user={})
 
         self.assertEqual(
             result["mensaje"],
-            "Usuario desactivado; historial conservado",
+            "Usuario archivado y desactivado; historial conservado para reportes",
         )
         self.assertEqual(len(collection.documents), 1)
         self.assertFalse(collection.documents[0]["activo"])
+        self.assertTrue(collection.documents[0]["archivado"])
         self.assertEqual(collection.documents[0]["total_cargas"], 7)
         self.assertIn("fecha_baja", collection.documents[0])
 

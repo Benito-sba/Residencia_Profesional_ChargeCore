@@ -132,24 +132,41 @@ class ApiValidationTests(unittest.TestCase):
             [str(user_id), {"id": str(rule_id)}],
         )
 
-    def test_deleting_nfc_card_blocks_it_without_removing_its_uid(self):
+    def test_deleting_nfc_card_with_session_history_archives_it(self):
         card_id = ObjectId()
         card = {"_id": card_id, "uid": "CARD-0001", "estado": "activa"}
         cards = Mock()
         cards.find_one = AsyncMock(return_value=card)
         cards.update_one = AsyncMock(return_value=Mock(matched_count=1))
+        sessions = Mock()
+        sessions.count_documents = AsyncMock(return_value=1)
+        requests = Mock()
+        requests.count_documents = AsyncMock(return_value=0)
 
-        with patch.object(nfc_cards, "get_collection", return_value=cards):
-            response = asyncio.run(
-                nfc_cards.delete_nfc_card(
-                    str(card_id),
-                    current_user={"rol": "superadmin"},
-                )
-            )
+        def get_collection(name):
+            return {
+                "nfc_cards": cards,
+                "sesiones": sessions,
+                "nfc_charge_requests": requests,
+            }[name]
+
+        with (
+            patch.object(nfc_cards, "get_collection", side_effect=get_collection),
+            patch.object(
+                nfc_cards,
+                "get_database",
+                return_value=Mock(client=FakeMongoClient()),
+            ),
+        ):
+            response = asyncio.run(nfc_cards.delete_nfc_card(
+                str(card_id),
+                current_user={"rol": "superadmin"},
+            ))
 
         self.assertIn("historial conservado", response["mensaje"])
         update = cards.update_one.await_args.args[1]["$set"]
         self.assertEqual(update["estado"], "bloqueada")
+        self.assertTrue(update["archivado"])
         self.assertIn("fecha_baja", update)
         cards.delete_one.assert_not_called()
 
