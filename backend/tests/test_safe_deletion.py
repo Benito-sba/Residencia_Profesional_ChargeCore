@@ -166,6 +166,31 @@ class SafeDeletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(collections["vehiculos"].documents, [])
         self.assertEqual(collections["nfc_cards"].documents, [])
 
+    async def test_superadmin_can_remove_last_admin_without_deleting_superadmin(self):
+        admin_id = ObjectId()
+        superadmin_id = ObjectId()
+        collections, get_collection = self._collections(
+            usuarios=[
+                {"_id": admin_id, "rol": "admin", "activo": True},
+                {"_id": superadmin_id, "rol": "superadmin", "activo": True},
+            ],
+        )
+
+        with (
+            patch.object(users, "get_collection", side_effect=get_collection),
+            patch.object(users, "get_database", return_value=self._database()),
+        ):
+            result = await users.delete_user(
+                str(admin_id),
+                current_user={"_id": superadmin_id, "rol": "superadmin"},
+            )
+
+        self.assertIn("eliminado permanentemente", result["mensaje"])
+        self.assertEqual(
+            [user["_id"] for user in collections["usuarios"].documents],
+            [superadmin_id],
+        )
+
     async def test_user_with_asset_session_history_is_archived_without_changing_session(self):
         user_id = ObjectId()
         company_id = ObjectId()

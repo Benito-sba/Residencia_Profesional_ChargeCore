@@ -839,14 +839,21 @@ class UserAdministratorSafetyTests(unittest.IsolatedAsyncioTestCase):
             "_id": admin_id,
             "rol": "admin",
             "activo": True,
+        }, {
+            "_id": ObjectId(),
+            "rol": "superadmin",
+            "activo": True,
         }])
 
         with patch.object(users, "get_collection", return_value=collection):
             with self.assertRaises(HTTPException) as raised:
-                await users.delete_user(str(admin_id), current_user={})
+                await users.delete_user(
+                    str(admin_id),
+                    current_user={"rol": "admin"},
+                )
 
         self.assertEqual(raised.exception.status_code, 409)
-        self.assertEqual(len(collection.documents), 1)
+        self.assertEqual(len(collection.documents), 2)
 
     async def test_deleting_client_deactivates_account_and_preserves_history(self):
         user_id = ObjectId()

@@ -25,6 +25,28 @@ def _user_scope(current_user: dict) -> dict:
     return {}
 
 
+async def _can_remove_last_active_admin(users, current_user, session=None) -> bool:
+    active_admins = await users.count_documents(
+        {
+            "rol": "admin",
+            "activo": {"$ne": False},
+        },
+        session=session,
+    )
+    if active_admins > 1:
+        return True
+    if current_user.get("rol") != "superadmin":
+        return False
+    active_superadmins = await users.count_documents(
+        {
+            "rol": "superadmin",
+            "activo": {"$ne": False},
+        },
+        session=session,
+    )
+    return active_superadmins > 0
+
+
 async def _update_company_owner_atomically(
     users,
     target_query: dict,
@@ -396,10 +418,7 @@ async def delete_user(
     if (
         existing.get("rol") == "admin"
         and existing.get("activo", True)
-        and await users.count_documents({
-            "rol": "admin",
-            "activo": {"$ne": False},
-        }) <= 1
+        and not await _can_remove_last_active_admin(users, current_user)
     ):
         raise HTTPException(
             status_code=409,
@@ -432,13 +451,11 @@ async def delete_user(
                 if (
                     existing.get("rol") == "admin"
                     and existing.get("activo", True)
-                    and await users.count_documents(
-                        {
-                            "rol": "admin",
-                            "activo": {"$ne": False},
-                        },
+                    and not await _can_remove_last_active_admin(
+                        users,
+                        current_user,
                         session=session,
-                    ) <= 1
+                    )
                 ):
                     raise HTTPException(
                         status_code=409,
