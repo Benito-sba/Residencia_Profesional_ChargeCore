@@ -8,9 +8,13 @@ class SesionCargaBase(BaseModel):
     charge_point_id: str
     connector_id: int
     usuario_id: Optional[PyObjectId] = None
+    empresa_id: Optional[PyObjectId] = None
     vehiculo_id: Optional[PyObjectId] = None
     nfc_card_id: Optional[PyObjectId] = None
     transaction_id: int
+    ocpp_transaction_id: Optional[str] = None
+    evse_id: Optional[int] = None
+    subprotocolo_ocpp: Optional[str] = None
     estado: str = Field(default="iniciada", pattern="^(iniciada|activa|finalizada|error)$")
     fecha_inicio: datetime = Field(default_factory=datetime.utcnow)
     fecha_fin: Optional[datetime] = None

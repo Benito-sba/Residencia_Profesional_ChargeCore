@@ -13,8 +13,24 @@ from ocpp.v16 import ChargePoint as OCPPChargePoint
 from ocpp.v16.enums import Action, DataTransferStatus, RegistrationStatus
 from ocpp.v16 import call_result
 from ocpp.routing import on
-from app.database import db, get_collection, next_transaction_id
+from app.websocket.ocpp_v201 import OCPP201ChargePointHandler
+from app.websocket.ocpp_v21 import OCPP21ChargePointHandler
+from app.websocket.ocpp_protocols import (
+    OCPP_16_SUBPROTOCOLS,
+    OCPP_PROTOCOL_ADAPTERS,
+    OCPP_SUBPROTOCOLS,
+    IMPLEMENTED_OCPP_ADAPTERS,
+    select_ocpp_subprotocol,
+)
+from app.database import (
+    db,
+    get_collection,
+    next_transaction_id,
+    serialize_company_change,
+)
 from app.services.reward_service import verificar_y_otorgar_recompensa, aplicar_recompensa_en_sesion
+from app.services.company_reward_points import accrue_points_for_completed_session
+from app.services.ocpp_protocol_settings import get_ocpp_protocol_settings
 from app.ocpp_auth import parse_ocpp_basic_auth, verify_ocpp_password
 
 connected_chargers: Dict[str, WebSocket] = {}
@@ -23,6 +39,30 @@ RFC3339_TIMESTAMP = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})"
 )
+def _select_ocpp_subprotocol(
+    requested_protocols: list[str],
+    *,
+    enabled_protocols: list[str] | tuple[str, ...] = (
+        "ocpp1.6",
+        "ocpp2.0.1",
+        "ocpp2.1",
+    ),
+    automatic_detection: bool = True,
+    preferred_protocol: str | None = "ocpp1.6",
+) -> str | None:
+    return select_ocpp_subprotocol(
+        requested_protocols,
+        enabled_protocols=enabled_protocols,
+        automatic_detection=automatic_detection,
+        preferred_protocol=preferred_protocol,
+    )
+
+
+def _select_ocpp_16_subprotocol(requested_protocols: list[str]) -> str | None:
+    return next(
+        (protocol for protocol in OCPP_16_SUBPROTOCOLS if protocol in requested_protocols),
+        None,
+    )
 
 
 def _current_time() -> str:
@@ -32,7 +72,7 @@ def _current_time() -> str:
 class OCPPConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}
-        self.active_handlers: Dict[str, "ChargePointHandler"] = {}
+        self.active_handlers: Dict[str, Any] = {}
         self.pending_connections: set[str] = set()
         self.disconnect_events: Dict[str, asyncio.Event] = {}
         self.connection_tokens: Dict[str, str] = {}
@@ -90,10 +130,10 @@ class OCPPConnectionManager:
     def is_current_connection(self, charge_point_id: str, websocket: WebSocket) -> bool:
         return self.active_connections.get(charge_point_id) is websocket
 
-    def register_handler(self, charge_point_id: str, handler: "ChargePointHandler") -> None:
+    def register_handler(self, charge_point_id: str, handler: Any) -> None:
         self.active_handlers[charge_point_id] = handler
 
-    def get_handler(self, charge_point_id: str) -> Optional["ChargePointHandler"]:
+    def get_handler(self, charge_point_id: str) -> Optional[Any]:
         return self.active_handlers.get(charge_point_id)
 
     def get_disconnect_event(self, charge_point_id: str) -> Optional[asyncio.Event]:
@@ -149,10 +189,45 @@ class OCPPConnectionManager:
 ocpp_connection_manager = OCPPConnectionManager()
 
 
+async def _persist_company_activity(
+    collection_name: str,
+    document: dict,
+    *,
+    session=None,
+    upsert_filter: dict | None = None,
+) -> None:
+    document = dict(document)
+    charge_point_id = document.get("charge_point_id")
+    if document.get("empresa_id") is None and charge_point_id is not None:
+        charger = await get_collection("cargadores").find_one(
+            {"charge_point_id": charge_point_id}
+        )
+        if charger and charger.get("empresa_id") is not None:
+            document["empresa_id"] = charger["empresa_id"]
+
+    collection = get_collection(collection_name)
+    if upsert_filter is None:
+        if session is None:
+            await collection.insert_one(document)
+        else:
+            await collection.insert_one(document, session=session)
+        return
+
+    update_options = {"upsert": True}
+    if session is not None:
+        update_options["session"] = session
+    await collection.update_one(
+        upsert_filter,
+        {"$setOnInsert": document},
+        **update_options,
+    )
+
+
 async def persist_ocpp_message(
     charge_point_id: str,
     raw_message: str,
     parsed: Optional[Dict[str, Any]],
+    subprotocol: Optional[str] = None,
 ) -> None:
     try:
         raw_payload = json.loads(raw_message)
@@ -165,6 +240,7 @@ async def persist_ocpp_message(
 
     document = {
         "charge_point_id": charge_point_id,
+        "subprotocolo_ocpp": subprotocol,
         "direction": parsed.get("direction") if parsed else "unknown",
         "message_type": parsed.get("message_type") if parsed else None,
         "message_type_name": {
@@ -180,7 +256,7 @@ async def persist_ocpp_message(
         "raw_message": safe_raw_message,
         "timestamp": parsed.get("timestamp", datetime.utcnow()) if parsed else datetime.utcnow(),
     }
-    await get_collection("ocpp_messages").insert_one(document)
+    await _persist_company_activity("ocpp_messages", document)
     if parsed:
         await get_collection("cargadores").update_one(
             {"charge_point_id": charge_point_id},
@@ -324,9 +400,9 @@ def _read_charger_cleanup_receipt(charger: dict, session_id: Any, transaction_id
 async def _persist_stop_event(
     charge_point_id: str, transaction_id: int, meter_stop, kwargs
 ) -> None:
-    await get_collection("eventos_ocpp").update_one(
-        {"_id": f"stop:{charge_point_id}:{transaction_id}"},
-        {"$setOnInsert": {
+    await _persist_company_activity(
+        "eventos_ocpp",
+        {
             "charge_point_id": charge_point_id,
             "tipo_mensaje": "StopTransaction",
             "accion": "request",
@@ -336,8 +412,8 @@ async def _persist_stop_event(
                 **kwargs,
             },
             "timestamp": datetime.utcnow(),
-        }},
-        upsert=True,
+        },
+        upsert_filter={"_id": f"stop:{charge_point_id}:{transaction_id}"},
     )
 
 
@@ -367,10 +443,17 @@ def _power_to_kw(value: float, unit: Optional[str]) -> Optional[float]:
 
 
 class OCPPWebSocketProxy:
-    def __init__(self, websocket: WebSocket, charge_point_id: str, manager: OCPPConnectionManager):
+    def __init__(
+        self,
+        websocket: WebSocket,
+        charge_point_id: str,
+        manager: OCPPConnectionManager,
+        subprotocol: Optional[str] = None,
+    ):
         self._websocket = websocket
         self._charge_point_id = charge_point_id
         self._manager = manager
+        self._subprotocol = subprotocol
 
     def __getattr__(self, name: str):
         return getattr(self._websocket, name)
@@ -379,13 +462,23 @@ class OCPPWebSocketProxy:
         raw_message = await self._websocket.receive_text()
         parsed = self._manager.track_incoming(self._charge_point_id, raw_message)
         _log_ocpp_frame("recibido", self._charge_point_id, parsed)
-        await persist_ocpp_message(self._charge_point_id, raw_message, parsed)
+        await persist_ocpp_message(
+            self._charge_point_id,
+            raw_message,
+            parsed,
+            self._subprotocol,
+        )
         return raw_message
 
     async def send(self, data: str) -> None:
         parsed = self._manager.track_outgoing(self._charge_point_id, data)
         _log_ocpp_frame("enviado", self._charge_point_id, parsed)
-        await persist_ocpp_message(self._charge_point_id, data, parsed)
+        await persist_ocpp_message(
+            self._charge_point_id,
+            data,
+            parsed,
+            self._subprotocol,
+        )
         await self._websocket.send_text(data)
 
     async def receive_text(self) -> str:
@@ -458,7 +551,7 @@ class ChargePointHandler(OCPPChargePoint):
         self.connection_token = connection_token
         self.negotiated_subprotocol = negotiated_subprotocol
 
-    @on(Action.BootNotification)
+    @on(Action.boot_notification)
     async def on_boot_notification(self, charge_point_vendor, charge_point_model, **kwargs):
         cargadores_col = get_collection("cargadores")
         try:
@@ -476,7 +569,7 @@ class ChargePointHandler(OCPPChargePoint):
                 "No se pudieron reconciliar sesiones al iniciar %s",
                 self.charge_point_id,
             )
-            return call_result.BootNotificationPayload(
+            return call_result.BootNotification(
                 current_time=_current_time(),
                 interval=60,
                 status=RegistrationStatus.rejected,
@@ -537,13 +630,13 @@ class ChargePointHandler(OCPPChargePoint):
                 "No se pudieron actualizar los metadatos/reconciliar el cargador %s",
                 self.charge_point_id,
             )
-            return call_result.BootNotificationPayload(
+            return call_result.BootNotification(
                 current_time=_current_time(),
                 interval=60,
                 status=RegistrationStatus.rejected,
             )
 
-        await get_collection("eventos_ocpp").insert_one({
+        await _persist_company_activity("eventos_ocpp", {
             "charge_point_id": self.charge_point_id,
             "tipo_mensaje": "BootNotification",
             "accion": "request",
@@ -552,19 +645,19 @@ class ChargePointHandler(OCPPChargePoint):
         })
 
         if result.matched_count == 0:
-            return call_result.BootNotificationPayload(
+            return call_result.BootNotification(
                 current_time=_current_time(),
                 interval=60,
                 status=RegistrationStatus.rejected
             )
 
-        return call_result.BootNotificationPayload(
+        return call_result.BootNotification(
             current_time=_current_time(),
             interval=60,  # Intervalo de 60 segundos sugerido para Heartbeat
             status=RegistrationStatus.accepted
         )
 
-    @on(Action.Heartbeat)
+    @on(Action.heartbeat)
     async def on_heartbeat(self):
         await get_collection("cargadores").update_one(
             {"charge_point_id": self.charge_point_id},
@@ -575,7 +668,7 @@ class ChargePointHandler(OCPPChargePoint):
         )
         
         # Registrar evento en la colección general de eventos OCPP para visibilidad en frontend
-        await get_collection("eventos_ocpp").insert_one({
+        await _persist_company_activity("eventos_ocpp", {
             "charge_point_id": self.charge_point_id,
             "tipo_mensaje": "Heartbeat",
             "accion": "request",
@@ -588,11 +681,11 @@ class ChargePointHandler(OCPPChargePoint):
             "timestamp": datetime.utcnow()
         })
         
-        return call_result.HeartbeatPayload(current_time=_current_time())
+        return call_result.Heartbeat(current_time=_current_time())
 
-    @on(Action.DataTransfer)
+    @on(Action.data_transfer)
     async def on_data_transfer(self, vendor_id, message_id=None, data=None):
-        await get_collection("eventos_ocpp").insert_one({
+        await _persist_company_activity("eventos_ocpp", {
             "charge_point_id": self.charge_point_id,
             "tipo_mensaje": "DataTransfer",
             "accion": "request",
@@ -604,33 +697,33 @@ class ChargePointHandler(OCPPChargePoint):
             },
             "timestamp": datetime.utcnow(),
         })
-        return call_result.DataTransferPayload(
+        return call_result.DataTransfer(
             status=DataTransferStatus.unknown_vendor_id
         )
 
-    @on(Action.DiagnosticsStatusNotification)
+    @on(Action.diagnostics_status_notification)
     async def on_diagnostics_status_notification(self, status, **kwargs):
-        await get_collection("eventos_ocpp").insert_one({
+        await _persist_company_activity("eventos_ocpp", {
             "charge_point_id": self.charge_point_id,
             "tipo_mensaje": "DiagnosticsStatusNotification",
             "accion": "request",
             "payload": {"status": status, **kwargs},
             "timestamp": datetime.utcnow(),
         })
-        return call_result.DiagnosticsStatusNotificationPayload()
+        return call_result.DiagnosticsStatusNotification()
 
-    @on(Action.FirmwareStatusNotification)
+    @on(Action.firmware_status_notification)
     async def on_firmware_status_notification(self, status, **kwargs):
-        await get_collection("eventos_ocpp").insert_one({
+        await _persist_company_activity("eventos_ocpp", {
             "charge_point_id": self.charge_point_id,
             "tipo_mensaje": "FirmwareStatusNotification",
             "accion": "request",
             "payload": {"status": status, **kwargs},
             "timestamp": datetime.utcnow(),
         })
-        return call_result.FirmwareStatusNotificationPayload()
+        return call_result.FirmwareStatusNotification()
 
-    @on(Action.StatusNotification)
+    @on(Action.status_notification)
     async def on_status_notification(self, connector_id, status, error_code, **kwargs):
         cargadores_col = get_collection("cargadores")
         connector_update_time = datetime.utcnow()
@@ -638,6 +731,11 @@ class ChargePointHandler(OCPPChargePoint):
             "estado": status,
             "error_code": error_code,
             "ultima_actualizacion": connector_update_time,
+            **{
+                field: kwargs[field]
+                for field in ("evse_id", "ocpp_status")
+                if kwargs.get(field) is not None
+            },
         }
         new_connector = {
             "id_conector": connector_id,
@@ -725,6 +823,7 @@ class ChargePointHandler(OCPPChargePoint):
                                                                     "$$statuses",
                                                                     [
                                                                         "Charging",
+                                                                        "Occupied",
                                                                         "Preparing",
                                                                         "SuspendedEV",
                                                                         "SuspendedEVSE",
@@ -772,7 +871,7 @@ class ChargePointHandler(OCPPChargePoint):
             ],
         )
 
-        await get_collection("eventos_ocpp").insert_one({
+        await _persist_company_activity("eventos_ocpp", {
             "charge_point_id": self.charge_point_id,
             "tipo_mensaje": "StatusNotification",
             "accion": "request",
@@ -786,13 +885,18 @@ class ChargePointHandler(OCPPChargePoint):
             "estado": status,
             "error_code": error_code,
             "timestamp": datetime.utcnow(),
+            **{
+                field: kwargs[field]
+                for field in ("evse_id", "ocpp_status")
+                if kwargs.get(field) is not None
+            },
             "info": kwargs.get("info"),
             "vendor_id": kwargs.get("vendor_id"),
             "vendor_error_code": kwargs.get("vendor_error_code")
         })
 
         if status == "Faulted":
-            await get_collection("logs").insert_one({
+            await _persist_company_activity("logs", {
                 "nivel": "warning",
                 "modulo": "ocpp",
                 "mensaje": f"Cargador {self.charge_point_id} conector {connector_id} en Faulted",
@@ -800,24 +904,45 @@ class ChargePointHandler(OCPPChargePoint):
                 "timestamp": datetime.utcnow()
             })
 
-        return call_result.StatusNotificationPayload()
+        return call_result.StatusNotification()
 
-    @on(Action.Authorize)
+    @on(Action.authorize)
     async def on_authorize(self, id_tag):
         nfc_col = get_collection("nfc_cards")
         tarjeta = await nfc_col.find_one({"uid": id_tag})
+        charger = await get_collection("cargadores").find_one({
+            "charge_point_id": self.charge_point_id,
+            "activo": True,
+        })
         status = "Invalid"
         now = datetime.utcnow()
 
-        if tarjeta and tarjeta.get("estado") == "activa":
-            usuario = await get_collection("usuarios").find_one(
-                {"_id": tarjeta.get("usuario_id")}
-            )
+        company_id = charger.get("empresa_id") if charger else None
+        company = (
+            await get_collection("empresas").find_one({
+                "_id": company_id,
+                "activo": True,
+            })
+            if company_id is not None
+            else None
+        )
+        if (
+            tarjeta
+            and tarjeta.get("estado") == "activa"
+            and company is not None
+            and tarjeta.get("empresa_id") == company_id
+        ):
+            usuario = await get_collection("usuarios").find_one({
+                "_id": tarjeta.get("usuario_id"),
+                "empresa_id": company_id,
+                "rol": "cliente",
+            })
             if usuario and usuario.get("activo", True):
                 approved_request = await get_collection(
                     "nfc_charge_requests"
                 ).find_one({
                     "charge_point_id": self.charge_point_id,
+                    "empresa_id": company_id,
                     "uid": id_tag,
                     "usuario_id": tarjeta.get("usuario_id"),
                     "status": "start_requested",
@@ -832,6 +957,7 @@ class ChargePointHandler(OCPPChargePoint):
                     await get_collection("nfc_charge_requests").insert_one({
                         "_id": ObjectId(),
                         "charge_point_id": self.charge_point_id,
+                        "empresa_id": company_id,
                         "uid": id_tag,
                         "card_id": tarjeta["_id"],
                         "usuario_id": tarjeta["usuario_id"],
@@ -840,40 +966,64 @@ class ChargePointHandler(OCPPChargePoint):
                         "expires_at": now + timedelta(minutes=3),
                     })
 
-        await get_collection("eventos_ocpp").insert_one({
+        await _persist_company_activity("eventos_ocpp", {
             "charge_point_id": self.charge_point_id,
+            **({"empresa_id": company_id} if company_id is not None else {}),
             "tipo_mensaje": "Authorize",
             "accion": "request",
             "payload": {"resultado": status, "tag_present": bool(id_tag)},
             "timestamp": datetime.utcnow()
         })
 
-        return call_result.AuthorizePayload(id_tag_info={"status": status})
+        return call_result.Authorize(id_tag_info={"status": status})
 
-    @on(Action.StartTransaction)
+    @on(Action.start_transaction)
     async def on_start_transaction(self, connector_id, id_tag, meter_start, timestamp, **kwargs):
         nfc_col = get_collection("nfc_cards")
         tarjeta = await nfc_col.find_one({"uid": id_tag})
         now = datetime.utcnow()
+        charger = await get_collection("cargadores").find_one({
+            "charge_point_id": self.charge_point_id,
+            "activo": True,
+        })
+        company_id = charger.get("empresa_id") if charger else None
+        company = (
+            await get_collection("empresas").find_one({
+                "_id": company_id,
+                "activo": True,
+            })
+            if company_id is not None
+            else None
+        )
 
-        if not tarjeta or tarjeta.get("estado") != "activa":
-            await get_collection("eventos_ocpp").insert_one({
+        if (
+            not tarjeta
+            or tarjeta.get("estado") != "activa"
+            or company is None
+            or tarjeta.get("empresa_id") != company_id
+        ):
+            await _persist_company_activity("eventos_ocpp", {
                 "charge_point_id": self.charge_point_id,
                 "tipo_mensaje": "StartTransaction",
                 "accion": "request",
                 "payload": {"connector_id": connector_id, "resultado": "Invalid"},
                 "timestamp": datetime.utcnow(),
             })
-            return call_result.StartTransactionPayload(
+            return call_result.StartTransaction(
                 transaction_id=0,
                 id_tag_info={"status": "Invalid"},
             )
 
         usuario_id = tarjeta.get("usuario_id")
-        usuario = await get_collection("usuarios").find_one({"_id": usuario_id})
+        usuario = await get_collection("usuarios").find_one({
+            "_id": usuario_id,
+            "empresa_id": company_id,
+            "rol": "cliente",
+        })
         solicitud_col = get_collection("nfc_charge_requests")
         solicitud = await solicitud_col.find_one({
             "charge_point_id": self.charge_point_id,
+            "empresa_id": company_id,
             "uid": id_tag,
             "usuario_id": usuario_id,
             "status": "start_requested",
@@ -881,6 +1031,7 @@ class ChargePointHandler(OCPPChargePoint):
         if solicitud is None:
             started_request = await solicitud_col.find_one({
                 "charge_point_id": self.charge_point_id,
+                "empresa_id": company_id,
                 "uid": id_tag,
                 "usuario_id": usuario_id,
                 "status": "transaction_started",
@@ -889,11 +1040,12 @@ class ChargePointHandler(OCPPChargePoint):
             if started_request is not None:
                 active_session = await get_collection("sesiones").find_one({
                     "charge_point_id": self.charge_point_id,
+                    "empresa_id": company_id,
                     "nfc_card_id": tarjeta["_id"],
                     "estado": "activa",
                 })
             if active_session is not None:
-                await get_collection("eventos_ocpp").insert_one({
+                await _persist_company_activity("eventos_ocpp", {
                     "charge_point_id": self.charge_point_id,
                     "tipo_mensaje": "StartTransaction",
                     "accion": "request",
@@ -904,7 +1056,7 @@ class ChargePointHandler(OCPPChargePoint):
                     },
                     "timestamp": now,
                 })
-                return call_result.StartTransactionPayload(
+                return call_result.StartTransaction(
                     transaction_id=0,
                     id_tag_info={"status": "ConcurrentTx"},
                 )
@@ -915,28 +1067,28 @@ class ChargePointHandler(OCPPChargePoint):
             or solicitud.get("expires_at") is None
             or solicitud["expires_at"] <= now
         ):
-            await get_collection("eventos_ocpp").insert_one({
+            await _persist_company_activity("eventos_ocpp", {
                 "charge_point_id": self.charge_point_id,
                 "tipo_mensaje": "StartTransaction",
                 "accion": "request",
                 "payload": {"connector_id": connector_id, "resultado": "Invalid"},
                 "timestamp": now,
             })
-            return call_result.StartTransactionPayload(
+            return call_result.StartTransaction(
                 transaction_id=0,
                 id_tag_info={"status": "Invalid"},
             )
 
         connector_id_requested = solicitud.get("connector_id")
         if connector_id_requested != connector_id:
-            await get_collection("eventos_ocpp").insert_one({
+            await _persist_company_activity("eventos_ocpp", {
                 "charge_point_id": self.charge_point_id,
                 "tipo_mensaje": "StartTransaction",
                 "accion": "request",
                 "payload": {"connector_id": connector_id, "resultado": "Invalid"},
                 "timestamp": now,
             })
-            return call_result.StartTransactionPayload(
+            return call_result.StartTransaction(
                 transaction_id=0,
                 id_tag_info={"status": "Invalid"},
             )
@@ -945,10 +1097,11 @@ class ChargePointHandler(OCPPChargePoint):
         vehiculo = await get_collection("vehiculos").find_one({
             "_id": vehiculo_id,
             "usuario_id": usuario_id,
+            "empresa_id": company_id,
             "activo": True,
         })
         if vehiculo is None:
-            return call_result.StartTransactionPayload(
+            return call_result.StartTransaction(
                 transaction_id=0,
                 id_tag_info={"status": "Invalid"},
             )
@@ -958,6 +1111,18 @@ class ChargePointHandler(OCPPChargePoint):
         eventos_col = get_collection("eventos_ocpp")
 
         async def persist_start(mongo_session):
+            company_update = await serialize_company_change(
+                company_id,
+                mongo_session,
+                get_collection("empresas"),
+                require_active=True,
+            )
+            if company_update.matched_count == 0:
+                return call_result.StartTransaction(
+                    transaction_id=0,
+                    id_tag_info={"status": "Invalid"},
+                )
+
             sesion_activa = await sesiones_col.find_one(
                 {
                     "charge_point_id": self.charge_point_id,
@@ -966,9 +1131,10 @@ class ChargePointHandler(OCPPChargePoint):
                 session=mongo_session,
             )
             if sesion_activa:
-                await eventos_col.insert_one(
+                await _persist_company_activity("eventos_ocpp",
                     {
                         "charge_point_id": self.charge_point_id,
+                        "empresa_id": company_id,
                         "tipo_mensaje": "StartTransaction",
                         "accion": "request",
                         "payload": {
@@ -980,33 +1146,38 @@ class ChargePointHandler(OCPPChargePoint):
                     },
                     session=mongo_session,
                 )
-                return call_result.StartTransactionPayload(
+                return call_result.StartTransaction(
                     transaction_id=0,
                     id_tag_info={"status": "ConcurrentTx"},
                 )
 
+            transaction_id = await next_transaction_id()
             request_update = await solicitud_col.update_one(
                 {
                     "_id": solicitud["_id"],
                     "status": "start_requested",
                     "charge_point_id": self.charge_point_id,
+                    "empresa_id": company_id,
                     "usuario_id": usuario_id,
                 },
                 {"$set": {
                     "status": "transaction_started",
                     "started_at": now,
+                    "transaction_id": transaction_id,
                 }},
                 session=mongo_session,
             )
             if request_update.matched_count != 1:
-                return call_result.StartTransactionPayload(
+                return call_result.StartTransaction(
                     transaction_id=0,
                     id_tag_info={"status": "Invalid"},
                 )
 
-            transaction_id = await next_transaction_id()
             charger_update = await cargadores_col.update_one(
-                {"charge_point_id": self.charge_point_id},
+                {
+                    "charge_point_id": self.charge_point_id,
+                    "empresa_id": company_id,
+                },
                 {
                     "$set": {
                         "estado_general": "ocupado",
@@ -1026,10 +1197,11 @@ class ChargePointHandler(OCPPChargePoint):
                     f"No se encontró el cargador {self.charge_point_id} "
                     f"al iniciar transaction_id {transaction_id}"
                 )
-
             session_started_at = datetime.utcnow()
             sesion = {
                 "charge_point_id": self.charge_point_id,
+                "empresa_id": company_id,
+                "subprotocolo_ocpp": self.negotiated_subprotocol,
                 "connector_id": connector_id,
                 "usuario_id": usuario_id,
                 "vehiculo_id": vehiculo_id,
@@ -1046,11 +1218,17 @@ class ChargePointHandler(OCPPChargePoint):
                 "meter_start": meter_start,
                 "meter_stop": None,
                 "created_at": session_started_at,
+                **(
+                    {"qr_request_id": solicitud["_id"]}
+                    if solicitud.get("source") == "qr"
+                    else {}
+                ),
             }
             await sesiones_col.insert_one(sesion, session=mongo_session)
-            await eventos_col.insert_one(
+            await _persist_company_activity("eventos_ocpp",
                 {
                     "charge_point_id": self.charge_point_id,
+                    "empresa_id": company_id,
                     "tipo_mensaje": "StartTransaction",
                     "accion": "request",
                     "payload": {
@@ -1061,8 +1239,66 @@ class ChargePointHandler(OCPPChargePoint):
                 },
                 session=mongo_session,
             )
+            pending_start = charger.get("pending_remote_start") or {}
+            start_lock = charger.get("remote_start_lock") or {}
+            start_command = start_lock or pending_start
+            markers_match = (
+                not start_lock
+                or not pending_start
+                or start_lock.get("command_id") == pending_start.get("command_id")
+            )
+            if (
+                markers_match
+                and start_command.get("command_id")
+                and start_command.get("id_tag") == id_tag
+                and start_command.get("connector_id") == connector_id
+                and (
+                    start_command.get("request_id") is None
+                    or start_command.get("request_id") == solicitud.get("_id")
+                )
+            ):
+                command_id = start_command["command_id"]
+                start_filter = {
+                    "_id": charger["_id"],
+                    "charge_point_id": self.charge_point_id,
+                    "empresa_id": company_id,
+                    "$and": [
+                        {"$or": [
+                            {"pending_remote_start.command_id": command_id},
+                            {"pending_remote_start": {"$exists": False}},
+                        ]},
+                        {"$or": [
+                            {"remote_start_lock.command_id": command_id},
+                            {"remote_start_lock": {"$exists": False}},
+                        ]},
+                        {"$or": [
+                            {"pending_remote_start.command_id": command_id},
+                            {"remote_start_lock.command_id": command_id},
+                        ]},
+                    ],
+                }
+                await cargadores_col.update_one(
+                    start_filter,
+                    {
+                        "$set": {
+                            "last_remote_command_reconciliation": {
+                                "command_id": command_id,
+                                "action": "RemoteStartTransaction",
+                                "status": "confirmed",
+                                "evidence": "matching_start_transaction",
+                                "transaction_id": transaction_id,
+                                "reconciled_at": session_started_at,
+                            },
+                        },
+                        "$unset": {
+                            "pending_remote_start": "",
+                            "remote_start_lock": "",
+                        },
+                    },
+                    session=mongo_session,
+                )
 
-            return call_result.StartTransactionPayload(
+            return call_result.StartTransaction(
                 transaction_id=transaction_id,
                 id_tag_info={"status": "Accepted"},
             )
@@ -1117,7 +1353,7 @@ class ChargePointHandler(OCPPChargePoint):
         except DuplicateKeyError as error:
             if "one_active_session_per_client" not in str(error):
                 raise
-            await eventos_col.insert_one({
+            await _persist_company_activity("eventos_ocpp", {
                 "charge_point_id": self.charge_point_id,
                 "tipo_mensaje": "StartTransaction",
                 "accion": "request",
@@ -1127,12 +1363,12 @@ class ChargePointHandler(OCPPChargePoint):
                 },
                 "timestamp": datetime.utcnow(),
             })
-            return call_result.StartTransactionPayload(
+            return call_result.StartTransaction(
                 transaction_id=0,
                 id_tag_info={"status": "ConcurrentTx"},
             )
 
-    @on(Action.MeterValues)
+    @on(Action.meter_values)
     async def on_meter_values(self, connector_id, transaction_id, meter_value, **kwargs):
         if not isinstance(meter_value, list):
             raise ValueError("MeterValues meter_value must be a list")
@@ -1214,7 +1450,7 @@ class ChargePointHandler(OCPPChargePoint):
                     session=mongo_session,
                 )
                 if sesion is None:
-                    await get_collection("logs").insert_one(
+                    await _persist_company_activity("logs",
                         {
                             "nivel": "warning",
                             "modulo": "ocpp",
@@ -1231,19 +1467,25 @@ class ChargePointHandler(OCPPChargePoint):
                         },
                         session=mongo_session,
                     )
-                    return call_result.MeterValuesPayload()
+                    return call_result.MeterValues()
 
+                company_id = sesion.get("empresa_id")
+                meter_document = {
+                    "charge_point_id": self.charge_point_id,
+                    "connector_id": connector_id,
+                    "transaction_id": transaction_id,
+                    "sampled_values": meter_value,
+                    "timestamp": datetime.utcnow(),
+                }
+                if company_id is not None:
+                    meter_document["empresa_id"] = company_id
                 await get_collection("meter_values").insert_one(
-                    {
-                        "charge_point_id": self.charge_point_id,
-                        "connector_id": connector_id,
-                        "transaction_id": transaction_id,
-                        "sampled_values": meter_value,
-                        "timestamp": datetime.utcnow(),
-                    },
+                    meter_document,
                     session=mongo_session,
                 )
                 for telemetry_document in telemetry_documents:
+                    if company_id is not None:
+                        telemetry_document["empresa_id"] = company_id
                     await get_collection("telemetria").insert_one(
                         telemetry_document,
                         session=mongo_session,
@@ -1280,9 +1522,9 @@ class ChargePointHandler(OCPPChargePoint):
                             session=mongo_session,
                         )
 
-        return call_result.MeterValuesPayload()
+        return call_result.MeterValues()
 
-    @on(Action.StopTransaction)
+    @on(Action.stop_transaction)
     async def on_stop_transaction(self, transaction_id, meter_stop, timestamp, **kwargs):
         sesiones_col = get_collection("sesiones")
         active_query = {
@@ -1296,6 +1538,50 @@ class ChargePointHandler(OCPPChargePoint):
             fecha_inicio = sesion["fecha_inicio"]
             duracion = int((datetime.utcnow() - fecha_inicio).total_seconds() / 60)
             energia = max(0, meter_stop - (sesion.get("meter_start") or 0)) / 1000
+            completed_at = datetime.utcnow()
+            completion_data = {
+                "estado": "finalizada",
+                "fecha_fin": completed_at,
+                "energia_consumida_kwh": round(energia, 3),
+                "duracion_minutos": duracion,
+                "meter_stop": meter_stop,
+                "motivo_fin": kwargs.get("reason", "Normal"),
+            }
+            stop_lock = sesion.get("remote_stop_lock") or {}
+            persisted_stop = sesion.get("remote_stop_command") or {}
+            stop_command = stop_lock or persisted_stop
+            markers_match = (
+                not stop_lock
+                or not persisted_stop
+                or stop_lock.get("command_id") == persisted_stop.get("command_id")
+            )
+            stop_lock_matches_session = (
+                not stop_lock
+                or (
+                    stop_lock.get("charge_point_id") == self.charge_point_id
+                    and stop_lock.get("empresa_id") == sesion.get("empresa_id")
+                    and stop_lock.get("session_id") == sesion.get("_id")
+                    and stop_lock.get("transaction_id") == transaction_id
+                )
+            )
+            confirmed_stop_command = (
+                markers_match
+                and stop_lock_matches_session
+                and stop_command.get("command_id") is not None
+                and stop_command.get("status") in {
+                    "pending",
+                    "accepted",
+                    "indeterminate",
+                }
+            )
+            release_stop_lock = confirmed_stop_command and bool(stop_lock)
+            if confirmed_stop_command:
+                completion_data["remote_stop_command"] = {
+                    **stop_command,
+                    "status": "confirmed",
+                    "evidence": "matching_stop_transaction",
+                    "reconciled_at": completed_at,
+                }
 
             transition = None
             for _ in range(3):
@@ -1312,17 +1598,32 @@ class ChargePointHandler(OCPPChargePoint):
                     "charger_cleanup_status": "pending",
                     "event_recorded": False,
                 }
-                transition = await sesiones_col.update_one(
-                    {**active_query, **selection_filter},
-                    {"$set": {
-                        "estado": "finalizada",
-                        "fecha_fin": datetime.utcnow(),
-                        "energia_consumida_kwh": round(energia, 3),
-                        "duracion_minutos": duracion,
-                        "meter_stop": meter_stop,
-                        "motivo_fin": kwargs.get("reason", "Normal"),
+                update_filter = {**active_query, **selection_filter}
+                update = {
+                    "$set": {
+                        **completion_data,
                         "stop_closure": cierre,
-                    }},
+                    },
+                }
+                if release_stop_lock:
+                    command_id = stop_command["command_id"]
+                    update_filter["remote_stop_lock.command_id"] = command_id
+                    update_filter["remote_stop_lock.session_id"] = sesion["_id"]
+                    update_filter["$or"] = [
+                        {"remote_stop_command.command_id": command_id},
+                        {"remote_stop_command": {"$exists": False}},
+                    ]
+                    update["$unset"] = {"remote_stop_lock": ""}
+                elif confirmed_stop_command:
+                    update_filter["remote_stop_command.command_id"] = (
+                        stop_command["command_id"]
+                    )
+                    update_filter["remote_stop_command.status"] = {
+                        "$in": ["pending", "accepted", "indeterminate"],
+                    }
+                transition = await sesiones_col.update_one(
+                    update_filter,
+                    update,
                 )
                 if transition.modified_count == 1:
                     break
@@ -1331,8 +1632,10 @@ class ChargePointHandler(OCPPChargePoint):
                     break
 
             if transition and transition.modified_count == 1:
-                sesion["estado"] = "finalizada"
+                sesion.update(completion_data)
                 sesion["stop_closure"] = cierre
+                if release_stop_lock:
+                    sesion.pop("remote_stop_lock", None)
             else:
                 sesion = None
 
@@ -1344,7 +1647,7 @@ class ChargePointHandler(OCPPChargePoint):
             })
 
         if sesion is None:
-            await get_collection("logs").insert_one({
+            await _persist_company_activity("logs", {
                 "nivel": "warning",
                 "modulo": "ocpp",
                 "mensaje": f"StopTransaction recibido para transaction_id inexistente: {transaction_id}",
@@ -1354,7 +1657,7 @@ class ChargePointHandler(OCPPChargePoint):
             await _persist_stop_event(
                 self.charge_point_id, transaction_id, meter_stop, kwargs
             )
-            return call_result.StopTransactionPayload(
+            return call_result.StopTransaction(
                 id_tag_info={"status": "Invalid"}
             )
 
@@ -1407,7 +1710,8 @@ class ChargePointHandler(OCPPChargePoint):
 
         if not cierre.get("rewards_granted"):
             if usuario_id:
-                await verificar_y_otorgar_recompensa(str(usuario_id))
+                await verificar_y_otorgar_recompensa(sesion)
+                await accrue_points_for_completed_session(sesion)
             await _mark_stop_closure_stage(
                 sesiones_col, sesion, transaction_id, "rewards_granted"
             )
@@ -1548,7 +1852,7 @@ class ChargePointHandler(OCPPChargePoint):
                 sesiones_col, sesion, transaction_id, "event_recorded"
             )
 
-        return call_result.StopTransactionPayload(
+        return call_result.StopTransaction(
             id_tag_info={"status": "Accepted"}
         )
 
@@ -1605,48 +1909,161 @@ async def ocpp_endpoint(websocket: WebSocket, charge_point_id: str):
             return
         reserved = True
 
-        # ChargeCore supports OCPP 1.6J over JSON WebSocket only.
         requested_protocols = [
             protocol.strip()
             for protocol in websocket.headers.get("sec-websocket-protocol", "").split(",")
             if protocol.strip()
         ]
 
-        selected_subprotocol = "ocpp1.6j"
-        if selected_subprotocol not in requested_protocols:
+        protocol_settings = await get_ocpp_protocol_settings()
+        configured_protocol = charger.get("ocpp_version")
+        if configured_protocol:
+            selected_subprotocol = select_ocpp_subprotocol(
+                requested_protocols,
+                enabled_protocols=protocol_settings.enabled_protocols,
+                automatic_detection=False,
+                preferred_protocol=configured_protocol,
+            )
+        else:
+            selected_subprotocol = select_ocpp_subprotocol(
+                requested_protocols,
+                enabled_protocols=protocol_settings.enabled_protocols,
+                automatic_detection=protocol_settings.automatic_detection,
+                preferred_protocol=protocol_settings.preferred_protocol,
+            )
+        if selected_subprotocol is None:
+            logger.warning(
+                "Negociación OCPP incompatible para %s: ofrecidos=%s habilitados=%s "
+                "versión_configurada=%s detección_automática=%s preferida=%s",
+                _safe_ocpp_log_value(charge_point_id),
+                ", ".join(_safe_ocpp_log_value(item) for item in requested_protocols)
+                or "(ninguno)",
+                ", ".join(protocol_settings.enabled_protocols) or "(ninguno)",
+                configured_protocol or "(ninguna)",
+                protocol_settings.automatic_detection,
+                protocol_settings.preferred_protocol or "(ninguna)",
+            )
+            reason = (
+                "No hay un subprotocolo anunciado que esté habilitado y tenga "
+                "un adaptador implementado"
+            )
+            if configured_protocol:
+                reason += f"; versión configurada: {configured_protocol}"
+            elif not protocol_settings.automatic_detection:
+                reason += (
+                    f"; versión preferida: {protocol_settings.preferred_protocol}"
+                )
             await _close_websocket_safely(
                 websocket,
                 charge_point_id,
-                "Subprotocolo OCPP no soportado; ofrecidos: "
+                reason
+                + "; ofrecidos: "
                 + (", ".join(requested_protocols) or "(ninguno)"),
+            )
+            return
+        protocol_adapter = OCPP_PROTOCOL_ADAPTERS[selected_subprotocol]
+        if protocol_adapter not in IMPLEMENTED_OCPP_ADAPTERS:
+            await _close_websocket_safely(
+                websocket,
+                charge_point_id,
+                f"No hay un adaptador OCPP implementado para {selected_subprotocol}",
             )
             return
         await websocket.accept(subprotocol=selected_subprotocol)
         connection_token = ocpp_connection_manager.register(charge_point_id, websocket)
         connection_registered = True
-        connection_update = await get_collection("cargadores").update_one(
-            {"charge_point_id": charge_point_id, "activo": True},
-            {"$set": {
-                "conectado": True,
-                "subprotocolo_ocpp": selected_subprotocol,
-                "ultima_conexion": datetime.utcnow(),
-                "ultima_comunicacion": datetime.utcnow(),
-                "connection_token": connection_token,
-            }}
-        )
-        if connection_update.matched_count == 0:
+        connection_data = {
+            "conectado": True,
+            "subprotocolo_ocpp": selected_subprotocol,
+            "ultima_conexion": datetime.utcnow(),
+            "ultima_comunicacion": datetime.utcnow(),
+            "connection_token": connection_token,
+        }
+        if charger.get("empresa_id") is None:
+            connection_update = await get_collection("cargadores").update_one(
+                {"charge_point_id": charge_point_id, "activo": True},
+                {"$set": connection_data},
+            )
+        else:
+            try:
+                async with await db.client.start_session() as mongo_session:
+                    async with mongo_session.start_transaction():
+                        company_update = await serialize_company_change(
+                            charger["empresa_id"],
+                            mongo_session,
+                            get_collection("empresas"),
+                            require_active=True,
+                        )
+                        if company_update.matched_count == 0:
+                            connection_update = None
+                        else:
+                            connection_update = await get_collection(
+                                "cargadores"
+                            ).update_one(
+                                {
+                                    "charge_point_id": charge_point_id,
+                                    "empresa_id": charger["empresa_id"],
+                                    "activo": True,
+                                },
+                                {"$set": connection_data},
+                                session=mongo_session,
+                            )
+            except PyMongoError as error:
+                if (
+                    error.has_error_label("TransientTransactionError")
+                    or error.has_error_label("UnknownTransactionCommitResult")
+                ):
+                    logger.warning(
+                        "Conflicto al registrar la conexión OCPP de %s",
+                        _safe_ocpp_log_value(charge_point_id),
+                    )
+                    await _close_websocket_safely(
+                        websocket,
+                        charge_point_id,
+                        "Conflicto al registrar la conexión; vuelve a intentarlo",
+                    )
+                    return
+                raise
+        if connection_update is None or connection_update.matched_count == 0:
             await _close_websocket_safely(
-                websocket, charge_point_id, "Cargador deshabilitado"
+                websocket,
+                charge_point_id,
+                "Empresa no disponible o cargador deshabilitado",
             )
             return
 
-        proxy = OCPPWebSocketProxy(websocket, charge_point_id, ocpp_connection_manager)
-        cp = ChargePointHandler(
+        proxy = OCPPWebSocketProxy(
+            websocket,
+            charge_point_id,
+            ocpp_connection_manager,
+            subprotocol=selected_subprotocol,
+        )
+        legacy_handler = ChargePointHandler(
             charge_point_id,
             proxy,
             connection_token,
             negotiated_subprotocol=selected_subprotocol,
         )
+        if protocol_adapter == "v201":
+            cp = OCPP201ChargePointHandler(
+                charge_point_id,
+                proxy,
+                connection_token,
+                legacy_handler,
+            )
+        elif protocol_adapter == "v21":
+            cp = OCPP21ChargePointHandler(
+                charge_point_id,
+                proxy,
+                connection_token,
+                legacy_handler,
+            )
+        elif protocol_adapter == "v16":
+            cp = legacy_handler
+        else:
+            raise RuntimeError(
+                f"Adaptador OCPP registrado pero no implementado: {protocol_adapter}"
+            )
         ocpp_connection_manager.register_handler(charge_point_id, cp)
 
         logger.info(
@@ -1663,7 +2080,7 @@ async def ocpp_endpoint(websocket: WebSocket, charge_point_id: str):
                 {"charge_point_id": charge_point_id, "connection_token": connection_token},
                 {"$set": {"estado_general": "fuera_de_servicio", "conectado": False, "ultima_desconexion": datetime.utcnow()}}
             )
-            await get_collection("logs").insert_one({
+            await _persist_company_activity("logs", {
                 "nivel": "warning",
                 "modulo": "ocpp",
                 "mensaje": f"Cargador {charge_point_id} desconectado",

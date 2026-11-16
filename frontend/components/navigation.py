@@ -1,0 +1,143 @@
+NAVIGATION_GROUPS = (
+    (
+        "Vista general",
+        (
+            ("dashboard", "▦", "Panel de control"),
+            ("empresa", "🏢", "Mi empresa"),
+            ("empresas", "🏢", "Empresas"),
+            ("usuarios", "👥", "Usuarios"),
+            ("vehiculos", "🚘", "Vehículos"),
+            ("tarjetas", "💳", "Tarjetas NFC"),
+        ),
+    ),
+    (
+        "Operación",
+        (
+            ("cargadores", "🔌", "Cargadores"),
+            ("sesiones", "⏱️", "Sesiones"),
+            ("operaciones_qr", "▣", "Operaciones QR"),
+            ("eventos", "⚡", "Eventos OCPP"),
+        ),
+    ),
+    (
+        "Análisis",
+        (
+            ("recompensas", "🎁", "Recompensas"),
+            ("reportes", "📊", "Reportes"),
+            ("alertas", "🔔", "Alertas"),
+        ),
+    ),
+    (
+        "Cliente",
+        (
+            ("inicio", "🏠", "Inicio"),
+            ("mis_vehiculos", "🚘", "Mis Vehículos"),
+            ("mis_cargas", "⚡", "Mis Cargas"),
+            ("carga_activa", "🔋", "Carga Activa"),
+            ("mis_recompensas", "🎁", "Mis Recompensas"),
+        ),
+    ),
+)
+
+CLIENT_PAGE_KEYS = frozenset({
+    "inicio",
+    "perfil",
+    "mis_vehiculos",
+    "mis_cargas",
+    "carga_activa",
+    "mis_recompensas",
+})
+
+PAGE_ROUTES = {
+    "dashboard": "/pages/dashboard",
+    "configuracion": "/pages/configuracion",
+    "empresas": "/pages/empresas",
+    "empresa": "/pages/empresa",
+    "operaciones_qr": "/pages/operaciones_qr",
+    "usuarios": "/pages/usuarios",
+    "vehiculos": "/pages/vehiculos",
+    "tarjetas": "/pages/tarjetas",
+    "cargadores": "/pages/cargadores",
+    "sesiones": "/pages/sesiones",
+    "eventos": "/pages/eventos",
+    "recompensas": "/pages/recompensas",
+    "reportes": "/pages/reportes",
+    "alertas": "/pages/alertas",
+    "inicio": "/portal-cliente",
+    "perfil": "/pages/perfil",
+    "mis_vehiculos": "/pages/mis_vehiculos",
+    "mis_cargas": "/pages/mis_cargas",
+    "carga_activa": "/pages/carga_activa",
+    "mis_recompensas": "/pages/mis_recompensas",
+    "beneficios_chargecore": "/pages/beneficios_chargecore",
+    "mis_beneficios_chargecore": "/pages/mis_beneficios_chargecore",
+    "recompensas_empresa": "/pages/recompensas_empresa",
+    "mis_recompensas_empresa": "/pages/mis_recompensas_empresa",
+}
+
+PAGE_MODULES = {
+    "dashboard": "Dashboard",
+    "configuracion": "Configuracion",
+    "usuarios": "Usuarios",
+    "vehiculos": "Vehiculos",
+    "tarjetas": "Tarjetas_NFC",
+    "cargadores": "Cargadores",
+    "sesiones": "Sesiones",
+    "eventos": "Eventos_OCPP",
+    "recompensas": "Company_Rewards",
+    "beneficios_chargecore": "Company_Rewards",
+    "mis_beneficios_chargecore": "Company_Rewards",
+    "recompensas_empresa": "Company_Rewards",
+    "reportes": "Reportes",
+    "alertas": "Alertas",
+    "perfil": "Mis_Perfil",
+    "mis_vehiculos": "Client_Mis_Vehiculos",
+    "mis_cargas": "Client_Mis_Cargas",
+    "carga_activa": "Client_Carga_Activa",
+    "mis_recompensas": "Client_Mis_Recompensas",
+    "mis_recompensas_empresa": "Client_Company_Rewards",
+}
+
+ROLE_HOME_ROUTES = {
+    "superadmin": PAGE_ROUTES["dashboard"],
+    "dueno_empresa": PAGE_ROUTES["dashboard"],
+    "cliente": PAGE_ROUTES["inicio"],
+}
+
+ROLE_PAGE_KEYS = {
+    "superadmin": frozenset({
+        "perfil",
+        "dashboard",
+        "empresas",
+        "usuarios",
+        "vehiculos",
+        "tarjetas",
+        "cargadores",
+        "sesiones",
+        "operaciones_qr",
+        "eventos",
+        "recompensas",
+        "beneficios_chargecore",
+        "reportes",
+        "alertas",
+        "configuracion",
+    }),
+    "dueno_empresa": frozenset({
+        "perfil",
+        "dashboard",
+        "empresa",
+        "usuarios",
+        "vehiculos",
+        "tarjetas",
+        "cargadores",
+        "sesiones",
+        "operaciones_qr",
+        "eventos",
+        "reportes",
+        "alertas",
+        "recompensas",
+        "mis_beneficios_chargecore",
+        "recompensas_empresa",
+    }),
+    "cliente": CLIENT_PAGE_KEYS,
+}

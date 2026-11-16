@@ -65,6 +65,48 @@ class DatabaseStartupTests(unittest.IsolatedAsyncioTestCase):
             and options.get("unique") is True
             for _, options in reward_indexes
         ))
+        expected_phase4_indexes = {
+            "commercial_benefits_active_created",
+            "commercial_assignment_request_unique",
+            "commercial_assignments_company_date",
+            "commercial_assignments_benefit_date",
+            "commercial_movements_company_assignment_date",
+            "company_reward_catalog_company_active_date",
+            "company_reward_catalog_company_expiration",
+            "company_reward_balance_owner_unique",
+            "company_reward_balances_company_updated",
+            "company_reward_accrual_session_unique",
+            "company_reward_ledger_company_user_date",
+            "company_reward_pending_request_unique",
+            "company_reward_redemptions_company_user_date",
+            "company_reward_redemptions_company_state_date",
+        }
+        all_phase4_collections = (
+            "commercial_benefits",
+            "commercial_benefit_assignments",
+            "commercial_benefit_movements",
+            "company_reward_catalog",
+            "company_reward_balances",
+            "company_reward_ledger",
+            "company_reward_redemptions",
+        )
+        actual_phase4_indexes = {
+            options["name"]
+            for collection_name in all_phase4_collections
+            for _, options in fake_database.collections[collection_name].created_indexes
+            if "name" in options
+        }
+        self.assertEqual(actual_phase4_indexes, expected_phase4_indexes)
+        for collection_name in all_phase4_collections:
+            if collection_name == "company_reward_rules":
+                continue
+            self.assertTrue(
+                fake_database.collections[collection_name].created_indexes
+            )
+        self.assertEqual(
+            getattr(fake_database, "company_reward_rules").created_indexes,
+            [],
+        )
 
     async def test_production_startup_rejects_standalone_mongodb(self):
         fake_database = FakeDatabase()
@@ -81,6 +123,24 @@ class DatabaseStartupTests(unittest.IsolatedAsyncioTestCase):
                 await database.connect_db()
         finally:
             database.db.client = previous_client
+
+    async def test_debug_startup_also_rejects_standalone_mongodb(self):
+        fake_database = FakeDatabase()
+        fake_database.command = AsyncMock(return_value={"isWritablePrimary": True})
+        previous_client = database.db.client
+
+        try:
+            with (
+                patch.object(database, "AsyncIOMotorClient"),
+                patch.object(database, "get_database", return_value=fake_database),
+                patch.object(database.settings, "DEBUG", True),
+                self.assertRaisesRegex(RuntimeError, "replica set"),
+            ):
+                await database.connect_db()
+        finally:
+            database.db.client = previous_client
+
+        fake_database.command.assert_awaited_once_with("hello")
 
     async def test_lifespan_closes_database_client_when_startup_fails(self):
         with (

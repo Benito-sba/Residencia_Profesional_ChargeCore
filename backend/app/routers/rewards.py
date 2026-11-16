@@ -3,7 +3,7 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException, Depends, status
 from bson import ObjectId
 from app.database import get_collection
-from app.auth import require_admin, require_read_access
+from app.auth import require_superadmin
 from app.models.reward import (
     RecompensaCatalogoCreate,
     RecompensaCatalogoUpdate,
@@ -99,7 +99,7 @@ def _validate_catalog_update_dates(existing, update_data):
 
 
 @router.get("/catalogo")
-async def list_reward_catalog(current_user=Depends(require_read_access)):
+async def list_reward_catalog(current_user=Depends(require_superadmin)):
     cursor = get_collection("recompensa_catalogo").find().sort("nombre", 1)
     return [_serialize_catalog(catalog) async for catalog in cursor]
 
@@ -107,7 +107,7 @@ async def list_reward_catalog(current_user=Depends(require_read_access)):
 @router.post("/catalogo", status_code=status.HTTP_201_CREATED)
 async def create_reward_catalog(
     catalog: RecompensaCatalogoCreate,
-    current_user=Depends(require_admin),
+    current_user=Depends(require_superadmin),
 ):
     duplicate = await get_collection("recompensa_catalogo").find_one(
         {"nombre": catalog.nombre, "empresa": catalog.empresa}
@@ -130,7 +130,7 @@ async def create_reward_catalog(
 async def update_reward_catalog(
     catalog_id: str,
     catalog: RecompensaCatalogoUpdate,
-    current_user=Depends(require_admin),
+    current_user=Depends(require_superadmin),
 ):
     object_id = parse_object_id(catalog_id, "recompensa")
     existing = await _get_catalog(object_id)
@@ -158,7 +158,7 @@ async def update_reward_catalog(
 async def update_reward_catalog_status(
     catalog_id: str,
     state: ReglaRecompensaEstado,
-    current_user=Depends(require_admin),
+    current_user=Depends(require_superadmin),
 ):
     object_id = parse_object_id(catalog_id, "recompensa")
     await _get_catalog(object_id)
@@ -171,7 +171,7 @@ async def update_reward_catalog_status(
 
 
 @router.get("/reglas")
-async def list_reward_rules(current_user=Depends(require_read_access)):
+async def list_reward_rules(current_user=Depends(require_superadmin)):
     cursor = get_collection("recompensa_reglas").find().sort("cargas_requeridas", 1)
     rules = []
     async for rule in cursor:
@@ -185,7 +185,7 @@ async def list_reward_rules(current_user=Depends(require_read_access)):
 
 
 @router.post("/reglas", status_code=status.HTTP_201_CREATED)
-async def create_reward_rule(rule: ReglaRecompensaCreate, current_user=Depends(require_admin)):
+async def create_reward_rule(rule: ReglaRecompensaCreate, current_user=Depends(require_superadmin)):
     if rule.activa:
         await _ensure_active_rule_allowed(rule.recompensa_catalogo_id)
     else:
@@ -204,7 +204,7 @@ async def create_reward_rule(rule: ReglaRecompensaCreate, current_user=Depends(r
 async def update_reward_rule(
     rule_id: str,
     rule: ReglaRecompensaUpdate,
-    current_user=Depends(require_admin),
+    current_user=Depends(require_superadmin),
 ):
     object_id = parse_object_id(rule_id, "regla")
     existing = await get_collection("recompensa_reglas").find_one({"_id": object_id})
@@ -234,7 +234,7 @@ async def update_reward_rule(
 async def update_reward_rule_status(
     rule_id: str,
     state: ReglaRecompensaEstado,
-    current_user=Depends(require_admin),
+    current_user=Depends(require_superadmin),
 ):
     object_id = parse_object_id(rule_id, "regla")
     existing = await get_collection("recompensa_reglas").find_one({"_id": object_id})
@@ -253,7 +253,10 @@ async def update_reward_rule_status(
     return _serialize_rule(updated)
 
 @router.get("/")
-async def list_rewards(usuario_id: str = None, current_user=Depends(require_read_access)):
+async def list_rewards(
+    usuario_id: str = None,
+    current_user=Depends(require_superadmin),
+):
     query = {}
     if usuario_id:
         query["usuario_id"] = parse_object_id(usuario_id, "usuario")
@@ -265,7 +268,10 @@ async def list_rewards(usuario_id: str = None, current_user=Depends(require_read
     return rewards
 
 @router.get("/usuario/{user_id}")
-async def get_user_rewards(user_id: str, current_user=Depends(require_read_access)):
+async def get_user_rewards(
+    user_id: str,
+    current_user=Depends(require_superadmin),
+):
     cursor = get_collection("recompensas").find(
         {"usuario_id": parse_object_id(user_id, "usuario")}
     ).sort("fecha_otorgamiento", -1)

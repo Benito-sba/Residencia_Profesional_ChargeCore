@@ -1,4 +1,5 @@
 import asyncio
+import asyncio
 import base64
 import copy
 import json
@@ -13,10 +14,33 @@ from bson import ObjectId
 from pymongo.errors import DuplicateKeyError, OperationFailure
 
 from app.services import ocpp_command_service
+from app.services import company_reward_points
 from app.services import reward_service
 from app.websocket import ocpp_server
+from app.websocket import ocpp_v201
+from app.websocket.ocpp_v201 import OCPP201ChargePointHandler
+from app.websocket.ocpp_v21 import OCPP21ChargePointHandler
 from app.ocpp_auth import hash_ocpp_password
 from app.models.charger import Conector
+
+
+class FakeCursor:
+    def __init__(self, documents):
+        self.documents = documents
+
+    def limit(self, count):
+        self.documents = self.documents[:count]
+        return self
+
+    def __aiter__(self):
+        self._iterator = iter(self.documents)
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._iterator)
+        except StopIteration:
+            raise StopAsyncIteration
 
 
 class FakeCollection:
@@ -31,6 +55,14 @@ class FakeCollection:
             return self.document.copy()
         return None
 
+    def find(self, query):
+        documents = (
+            [self.document.copy()]
+            if self._matches(query)
+            else []
+        )
+        return FakeCursor(documents)
+
     async def update_one(self, query, update, upsert=False):
         self.update_calls.append((query, update))
         if self.lose_update_race:
@@ -38,6 +70,15 @@ class FakeCollection:
         if self._matches(query):
             for key, value in update.get("$set", {}).items():
                 self._set_path(self.document, key, value)
+            for key in update.get("$unset", {}):
+                parts = key.split(".")
+                target = self.document
+                for part in parts[:-1]:
+                    target = target.get(part, {})
+                    if not isinstance(target, dict):
+                        break
+                if isinstance(target, dict):
+                    target.pop(parts[-1], None)
             return SimpleNamespace(matched_count=1, modified_count=1)
         if not upsert:
             return SimpleNamespace(matched_count=0, modified_count=0)
@@ -81,6 +122,10 @@ class FakeCollection:
                 if exists != value["$exists"]:
                     return False
                 continue
+            if isinstance(value, dict) and "$in" in value:
+                if actual not in value["$in"]:
+                    return False
+                continue
             if actual != value:
                 return False
         return True
@@ -92,6 +137,109 @@ class FakeCollection:
         for part in parts[:-1]:
             target = target.setdefault(part, {})
         target[parts[-1]] = value
+
+
+class StaticCollection:
+    def __init__(self, documents=None, document=None, before_update=None):
+        self.documents = list(documents or [])
+        if document is not None:
+            self.documents.append(document)
+        self.before_update = before_update
+        self.update_calls = []
+        self.insert_calls = []
+        self._update_lock = asyncio.Lock()
+
+    @staticmethod
+    def _value_at_path(document, path):
+        value = document
+        for part in path.split("."):
+            if not isinstance(value, dict) or part not in value:
+                return None, False
+            value = value[part]
+        return value, True
+
+    @classmethod
+    def _matches(cls, document, query):
+        for key, expected in query.items():
+            if key == "$or":
+                if not any(cls._matches(document, item) for item in expected):
+                    return False
+                continue
+            if key == "$and":
+                if not all(cls._matches(document, item) for item in expected):
+                    return False
+                continue
+            actual, exists = cls._value_at_path(document, key)
+            if isinstance(expected, dict):
+                if "$exists" in expected and exists != expected["$exists"]:
+                    return False
+                if "$in" in expected and actual not in expected["$in"]:
+                    return False
+                if "$gte" in expected and (
+                    actual is None or actual < expected["$gte"]
+                ):
+                    return False
+                if "$lte" in expected and (
+                    actual is None or actual > expected["$lte"]
+                ):
+                    return False
+                if "$ne" in expected and actual == expected["$ne"]:
+                    return False
+            elif actual != expected:
+                return False
+        return True
+
+    @staticmethod
+    def _set_path(document, path, value):
+        parts = path.split(".")
+        target = document
+        for part in parts[:-1]:
+            target = target.setdefault(part, {})
+        target[parts[-1]] = value
+
+    @staticmethod
+    def _unset_path(document, path):
+        parts = path.split(".")
+        target = document
+        for part in parts[:-1]:
+            target = target.get(part)
+            if not isinstance(target, dict):
+                return
+        target.pop(parts[-1], None)
+
+    def find(self, query):
+        documents = [
+            item for item in self.documents
+            if self._matches(item, query)
+        ]
+        return FakeCursor(documents)
+
+    async def find_one(self, query):
+        return next(
+            (item for item in self.documents if self._matches(item, query)),
+            None,
+        )
+
+    async def update_one(self, query, update):
+        self.update_calls.append((query, update))
+        if self.before_update is not None:
+            await self.before_update()
+        async with self._update_lock:
+            document = next(
+                (item for item in self.documents if self._matches(item, query)),
+                None,
+            )
+            if document is None:
+                return SimpleNamespace(matched_count=0, modified_count=0)
+            for path, value in update.get("$set", {}).items():
+                self._set_path(document, path, value)
+            for path in update.get("$unset", {}):
+                self._unset_path(document, path)
+            return SimpleNamespace(matched_count=1, modified_count=1)
+
+    async def insert_one(self, document):
+        self.insert_calls.append(document)
+        self.documents.append(document)
 
 
 class OCPPMessageTrackingTests(unittest.TestCase):
@@ -132,12 +280,771 @@ def active_session(charge_point_id="CP-1"):
 
 
 class RemoteStopServiceTests(unittest.IsolatedAsyncioTestCase):
-    async def test_remote_start_sends_expected_payload(self):
+    def _start_case(self, before_update=None):
+        requested_at = datetime.utcnow()
+        company_id = ObjectId()
+        request_id = ObjectId()
+        pending_start = {
+            "command_id": "start-command-1",
+            "id_tag": "TAG-1",
+            "connector_id": 2,
+            "request_id": request_id,
+            "requested_at": requested_at,
+            "status": "indeterminate",
+        }
+        charger = {
+            "_id": ObjectId(),
+            "charge_point_id": "CP-1",
+            "empresa_id": company_id,
+            "pending_remote_start": dict(pending_start),
+            "remote_start_lock": {
+                **pending_start,
+                "action": "RemoteStartTransaction",
+                "charge_point_id": "CP-1",
+                "empresa_id": company_id,
+            },
+        }
+        request = {
+            "_id": request_id,
+            "charge_point_id": "CP-1",
+            "empresa_id": company_id,
+            "uid": "TAG-1",
+            "usuario_id": "user-1",
+            "vehicle_id": "vehicle-1",
+            "connector_id": 2,
+            "status": "transaction_started",
+            "started_at": requested_at + timedelta(seconds=1),
+        }
+        session = {
+            "_id": ObjectId(),
+            "charge_point_id": "CP-1",
+            "empresa_id": company_id,
+            "usuario_id": "user-1",
+            "vehiculo_id": "vehicle-1",
+            "nfc_card_id": "card-1",
+            "connector_id": 2,
+            "transaction_id": 456,
+            "estado": "activa",
+            "fecha_inicio": requested_at + timedelta(seconds=2),
+        }
+        collections = {
+            "nfc_charge_requests": StaticCollection([request]),
+            "nfc_cards": StaticCollection(document={
+                "_id": "card-1",
+                "uid": "TAG-1",
+                "usuario_id": "user-1",
+                "empresa_id": company_id,
+            }),
+            "sesiones": StaticCollection([session]),
+            "cargadores": StaticCollection(
+                [charger],
+                before_update=before_update,
+            ),
+            "logs": StaticCollection(),
+        }
+        return charger, session, collections
+
+    def _stop_case(self, *, status="indeterminate", finalized=False, before_update=None):
+        requested_at = datetime.utcnow()
+        company_id = ObjectId()
+        session_id = ObjectId()
+        stop_command = {
+            "command_id": "stop-command-1",
+            "status": status,
+            "requested_at": requested_at,
+        }
+        charger = {
+            "_id": ObjectId(),
+            "charge_point_id": "CP-1",
+            "empresa_id": company_id,
+        }
+        session = {
+            "_id": session_id,
+            "charge_point_id": "CP-1",
+            "empresa_id": company_id,
+            "transaction_id": 123,
+            "estado": "finalizada" if finalized else "activa",
+            "fecha_fin": requested_at + timedelta(seconds=3) if finalized else None,
+            "remote_stop_command": dict(stop_command),
+            "remote_stop_lock": {
+                **stop_command,
+                "action": "RemoteStopTransaction",
+                "charge_point_id": "CP-1",
+                "empresa_id": company_id,
+                "session_id": session_id,
+                "transaction_id": 123,
+            },
+        }
+        collections = {
+            "sesiones": StaticCollection(
+                [session],
+                before_update=before_update,
+            ),
+            "logs": StaticCollection(),
+        }
+        return charger, session, collections
+
+    async def test_reconcile_start_only_clears_lock_with_matching_session_evidence(self):
+        requested_at = datetime.utcnow()
+        charger_id = ObjectId()
+        company_id = ObjectId()
+        actor_id = ObjectId()
+        charger = {
+            "_id": charger_id,
+            "charge_point_id": "CP-1",
+            "empresa_id": company_id,
+            "conectado": True,
+            "pending_remote_start": {
+                "command_id": "start-command-1",
+                "id_tag": "TAG-1",
+                "connector_id": 2,
+                "requested_at": requested_at,
+                "status": "indeterminate",
+            },
+        }
+        request = {
+            "charge_point_id": "CP-1",
+            "empresa_id": company_id,
+            "uid": "TAG-1",
+            "usuario_id": "user-1",
+            "vehicle_id": "vehicle-1",
+            "connector_id": 2,
+            "status": "transaction_started",
+            "started_at": requested_at + timedelta(seconds=1),
+        }
+        session = {
+            "charge_point_id": "CP-1",
+            "empresa_id": company_id,
+            "usuario_id": "user-1",
+            "vehiculo_id": "vehicle-1",
+            "nfc_card_id": "card-1",
+            "connector_id": 2,
+            "transaction_id": 456,
+            "estado": "activa",
+            "fecha_inicio": requested_at + timedelta(seconds=2),
+        }
+        collections = {
+            "nfc_charge_requests": StaticCollection([request]),
+            "nfc_cards": StaticCollection(document={
+                "_id": "card-1",
+                "uid": "TAG-1",
+                "usuario_id": "user-1",
+                "empresa_id": company_id,
+            }),
+            "sesiones": StaticCollection([session]),
+            "cargadores": StaticCollection([charger]),
+            "logs": StaticCollection(),
+        }
+
+        with patch.object(
+            ocpp_command_service,
+            "get_collection",
+            side_effect=collections.__getitem__,
+        ):
+            result = await ocpp_command_service.reconcile_remote_commands(
+                charger,
+                actor_id,
+            )
+
+        self.assertEqual(result["commands"][0]["status"], "confirmed")
+        self.assertFalse(result["commands"][0]["lock_retained"])
+        self.assertEqual(result["commands"][0]["session_status"], "activa")
+        update_filter, update = collections["cargadores"].update_calls[0]
+        self.assertEqual(
+            update_filter["pending_remote_start.command_id"],
+            "start-command-1",
+        )
+        self.assertIn("pending_remote_start", update["$unset"])
+        self.assertEqual(
+            update["$set"]["last_remote_command_reconciliation"]["transaction_id"],
+            456,
+        )
+        self.assertEqual(
+            collections["logs"].insert_calls[0]["datos"]["actor_id"],
+            str(actor_id),
+        )
+
+    async def test_reconcile_start_keeps_lock_when_evidence_is_missing(self):
+        charger = {
+            "_id": ObjectId(),
+            "charge_point_id": "CP-1",
+            "empresa_id": ObjectId(),
+            "pending_remote_start": {
+                "command_id": "start-command-1",
+                "id_tag": "TAG-1",
+                "connector_id": 2,
+                "requested_at": datetime.utcnow(),
+                "status": "indeterminate",
+            },
+        }
+        collections = {
+            "nfc_charge_requests": StaticCollection(),
+            "nfc_cards": StaticCollection(),
+            "sesiones": StaticCollection(),
+            "cargadores": StaticCollection([charger]),
+            "logs": StaticCollection(),
+        }
+
+        with patch.object(
+            ocpp_command_service,
+            "get_collection",
+            side_effect=collections.__getitem__,
+        ):
+            result = await ocpp_command_service.reconcile_remote_commands(
+                charger,
+                ObjectId(),
+            )
+
+        self.assertEqual(result["commands"][0]["status"], "unknown")
+        self.assertTrue(result["commands"][0]["lock_retained"])
+        self.assertEqual(result["commands"][0]["session_status"], "not_found")
+        self.assertIn("pending_remote_start", charger)
+        self.assertEqual(
+            collections["cargadores"].documents[0]["remote_start_lock"]["command_id"],
+            "start-command-1",
+        )
+
+    async def test_start_reconciliation_retains_lock_after_conflict_without_evidence(self):
+        charger, _, collections = self._start_case()
+
+        async def remove_pending_start():
+            charger.pop("pending_remote_start", None)
+
+        collections["cargadores"].before_update = remove_pending_start
         with (
+            patch.object(
+                ocpp_command_service,
+                "get_collection",
+                side_effect=collections.__getitem__,
+            ),
+            patch.object(
+                ocpp_command_service,
+                "_protocol_handler",
+                return_value=None,
+            ),
+            patch.object(
+                ocpp_command_service,
+                "_call",
+                new_callable=AsyncMock,
+            ) as send,
+        ):
+            result = await ocpp_command_service.reconcile_remote_commands(
+                charger,
+                ObjectId(),
+            )
+
+        command = result["commands"][0]
+        self.assertEqual(command["status"], "unknown")
+        self.assertTrue(command["lock_retained"])
+        self.assertNotIn("pending_remote_start", charger)
+        self.assertEqual(
+            charger["remote_start_lock"]["command_id"],
+            "start-command-1",
+        )
+        self.assertGreaterEqual(len(collections["cargadores"].update_calls), 2)
+        with patch.object(
+            ocpp_command_service,
+            "get_collection",
+            side_effect=collections.__getitem__,
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await ocpp_command_service.remote_start(
+                    "CP-1",
+                    "TAG-1",
+                    2,
+                    request_id=charger["remote_start_lock"]["request_id"],
+                )
+        self.assertEqual(raised.exception.status_code, 409)
+        send.assert_not_awaited()
+        self.assertEqual(
+            collections["logs"].insert_calls[0]["datos"]["status"],
+            "unknown",
+        )
+
+    async def test_start_reconciliation_releases_persisted_lock_after_later_evidence(self):
+        charger, _, collections = self._start_case()
+
+        async def remove_start_evidence():
+            charger.pop("pending_remote_start", None)
+            collections["nfc_charge_requests"].documents[0]["status"] = (
+                "start_requested"
+            )
+
+        collections["cargadores"].before_update = remove_start_evidence
+        with patch.object(
+            ocpp_command_service,
+            "get_collection",
+            side_effect=collections.__getitem__,
+        ):
+            first = await ocpp_command_service.reconcile_remote_commands(
+                charger,
+                ObjectId(),
+            )
+
+        self.assertEqual(first["commands"][0]["status"], "unknown")
+        self.assertEqual(
+            charger["remote_start_lock"]["command_id"],
+            "start-command-1",
+        )
+
+        collections["cargadores"].before_update = None
+        collections["nfc_charge_requests"].documents[0]["status"] = (
+            "transaction_started"
+        )
+        charger["last_remote_command_reconciliation"] = {
+            "command_id": "start-command-1",
+            "action": "RemoteStartTransaction",
+            "status": "confirmed",
+            "evidence": "matching_start_transaction",
+            "transaction_id": 456,
+        }
+        with patch.object(
+            ocpp_command_service,
+            "get_collection",
+            side_effect=collections.__getitem__,
+        ):
+            second = await ocpp_command_service.reconcile_remote_commands(
+                charger,
+                ObjectId(),
+            )
+
+        self.assertEqual(second["commands"][0]["status"], "confirmed")
+        self.assertNotIn("remote_start_lock", charger)
+
+    async def test_reconcile_stop_confirms_a_finalized_session(self):
+        requested_at = datetime.utcnow()
+        actor_id = ObjectId()
+        charger = {
+            "_id": ObjectId(),
+            "charge_point_id": "CP-1",
+            "empresa_id": ObjectId(),
+        }
+        session = {
+            "_id": ObjectId(),
+            "charge_point_id": "CP-1",
+            "empresa_id": charger["empresa_id"],
+            "transaction_id": 123,
+            "estado": "finalizada",
+            "fecha_fin": requested_at + timedelta(seconds=3),
+            "remote_stop_command": {
+                "command_id": "stop-command-1",
+                "status": "indeterminate",
+                "requested_at": requested_at,
+            },
+        }
+        collections = {
+            "sesiones": StaticCollection([session]),
+            "logs": StaticCollection(),
+        }
+
+        with patch.object(
+            ocpp_command_service,
+            "get_collection",
+            side_effect=collections.__getitem__,
+        ):
+            result = await ocpp_command_service.reconcile_remote_commands(
+                charger,
+                actor_id,
+            )
+
+        self.assertEqual(result["commands"][0]["status"], "confirmed")
+        self.assertFalse(result["commands"][0]["lock_retained"])
+        self.assertEqual(
+            collections["sesiones"].update_calls[0][1]["$set"][
+                "remote_stop_command"
+            ]["status"],
+            "confirmed",
+        )
+
+    async def test_reconcile_stop_keeps_lock_when_session_is_still_active(self):
+        requested_at = datetime.utcnow()
+        charger = {
+            "_id": ObjectId(),
+            "charge_point_id": "CP-1",
+            "empresa_id": ObjectId(),
+        }
+        session = {
+            "_id": ObjectId(),
+            "charge_point_id": "CP-1",
+            "empresa_id": charger["empresa_id"],
+            "transaction_id": 123,
+            "estado": "activa",
+            "remote_stop_command": {
+                "command_id": "stop-command-1",
+                "status": "indeterminate",
+                "requested_at": requested_at,
+            },
+        }
+        collections = {
+            "sesiones": StaticCollection([session]),
+            "logs": StaticCollection(),
+        }
+
+        with patch.object(
+            ocpp_command_service,
+            "get_collection",
+            side_effect=collections.__getitem__,
+        ):
+            result = await ocpp_command_service.reconcile_remote_commands(
+                charger,
+                ObjectId(),
+            )
+
+        self.assertEqual(result["commands"][0]["status"], "unknown")
+        self.assertTrue(result["commands"][0]["lock_retained"])
+        self.assertEqual(result["commands"][0]["session_status"], "activa")
+        self.assertEqual(
+            session["remote_stop_lock"]["command_id"],
+            "stop-command-1",
+        )
+
+    async def test_stop_reconciliation_retains_lock_after_conflict_without_evidence(self):
+        charger, session, collections = self._stop_case(finalized=True)
+
+        async def remove_stop_evidence():
+            session["estado"] = "activa"
+            session["fecha_fin"] = None
+            session.pop("remote_stop_command", None)
+
+        collections["sesiones"].before_update = remove_stop_evidence
+        with (
+            patch.object(
+                ocpp_command_service,
+                "get_collection",
+                side_effect=collections.__getitem__,
+            ),
+            patch.object(
+                ocpp_command_service,
+                "_protocol_handler",
+                return_value=None,
+            ),
+            patch.object(
+                ocpp_command_service,
+                "_call",
+                new_callable=AsyncMock,
+            ) as send,
+        ):
+            result = await ocpp_command_service.reconcile_remote_commands(
+                charger,
+                ObjectId(),
+            )
+
+        command = result["commands"][0]
+        self.assertEqual(command["status"], "unknown")
+        self.assertTrue(command["lock_retained"])
+        self.assertIn(session, collections["sesiones"].documents)
+        self.assertNotIn("remote_stop_command", session)
+        self.assertEqual(
+            session["remote_stop_lock"]["command_id"],
+            "stop-command-1",
+        )
+        self.assertGreaterEqual(len(collections["sesiones"].update_calls), 2)
+        with patch.object(
+            ocpp_command_service,
+            "get_collection",
+            side_effect=collections.__getitem__,
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await ocpp_command_service.remote_stop("CP-1", 123)
+        self.assertEqual(raised.exception.status_code, 409)
+        send.assert_not_awaited()
+        self.assertEqual(
+            collections["logs"].insert_calls[0]["datos"]["status"],
+            "unknown",
+        )
+
+    async def test_stop_reconciliation_releases_persisted_lock_after_later_evidence(self):
+        charger, session, collections = self._stop_case()
+        with patch.object(
+            ocpp_command_service,
+            "get_collection",
+            side_effect=collections.__getitem__,
+        ):
+            first = await ocpp_command_service.reconcile_remote_commands(
+                charger,
+                ObjectId(),
+            )
+
+            self.assertEqual(first["commands"][0]["status"], "unknown")
+            self.assertEqual(
+                session["remote_stop_lock"]["command_id"],
+                "stop-command-1",
+            )
+
+            session["estado"] = "finalizada"
+            session["fecha_fin"] = (
+                session["remote_stop_lock"]["requested_at"]
+                + timedelta(seconds=2)
+            )
+            second = await ocpp_command_service.reconcile_remote_commands(
+                charger,
+                ObjectId(),
+            )
+
+        self.assertEqual(second["commands"][0]["status"], "confirmed")
+        self.assertNotIn("remote_stop_lock", session)
+
+    async def test_start_reconciliation_rereads_event_confirmation_after_update_conflict(self):
+        charger, _, collections = self._start_case()
+
+        async def confirm_start_event():
+            charger.pop("pending_remote_start", None)
+            charger["last_remote_command_reconciliation"] = {
+                "command_id": "start-command-1",
+                "action": "RemoteStartTransaction",
+                "status": "confirmed",
+                "evidence": "matching_start_transaction",
+                "transaction_id": 456,
+            }
+
+        collections["cargadores"].before_update = confirm_start_event
+        with patch.object(
+            ocpp_command_service,
+            "get_collection",
+            side_effect=collections.__getitem__,
+        ):
+            result = await ocpp_command_service.reconcile_remote_commands(
+                charger,
+                ObjectId(),
+            )
+
+        command = result["commands"][0]
+        self.assertEqual(command["status"], "confirmed")
+        self.assertFalse(command["lock_retained"])
+        self.assertEqual(command["transaction_id"], 456)
+        self.assertEqual(
+            collections["logs"].insert_calls[0]["datos"]["status"],
+            "confirmed",
+        )
+
+    async def test_start_reconciliation_does_not_confirm_a_different_command_id(self):
+        charger, _, collections = self._start_case()
+
+        async def replace_pending_command():
+            charger["pending_remote_start"] = {
+                "command_id": "different-command",
+                "id_tag": "TAG-OTHER",
+                "connector_id": 1,
+                "requested_at": datetime.utcnow(),
+                "status": "indeterminate",
+            }
+
+        collections["cargadores"].before_update = replace_pending_command
+        with patch.object(
+            ocpp_command_service,
+            "get_collection",
+            side_effect=collections.__getitem__,
+        ):
+            result = await ocpp_command_service.reconcile_remote_commands(
+                charger,
+                ObjectId(),
+            )
+
+        command = result["commands"][0]
+        self.assertEqual(command["status"], "unknown")
+        self.assertTrue(command["lock_retained"])
+        self.assertEqual(
+            charger["pending_remote_start"]["command_id"],
+            "different-command",
+        )
+        self.assertEqual(
+            collections["logs"].insert_calls[0]["datos"]["status"],
+            "unknown",
+        )
+
+    async def test_stop_reconciliation_rereads_ocpp_confirmation_after_update_conflict(self):
+        charger, session, collections = self._stop_case(finalized=True)
+
+        async def confirm_stop_event():
+            session["remote_stop_command"].update({
+                "status": "confirmed",
+                "evidence": "matching_stop_transaction",
+                "reconciled_at": datetime.utcnow(),
+            })
+            session.pop("remote_stop_lock", None)
+
+        collections["sesiones"].before_update = confirm_stop_event
+        with patch.object(
+            ocpp_command_service,
+            "get_collection",
+            side_effect=collections.__getitem__,
+        ):
+            result = await ocpp_command_service.reconcile_remote_commands(
+                charger,
+                ObjectId(),
+            )
+
+        command = result["commands"][0]
+        self.assertEqual(command["status"], "confirmed")
+        self.assertFalse(command["lock_retained"])
+        self.assertEqual(command["evidence"], "matching_stop_transaction")
+        self.assertEqual(
+            collections["logs"].insert_calls[0]["datos"]["status"],
+            "confirmed",
+        )
+
+    async def test_stop_reconciliation_does_not_confirm_a_different_command_id(self):
+        charger, session, collections = self._stop_case(finalized=True)
+
+        async def replace_stop_command():
+            session["remote_stop_command"].update({
+                "command_id": "different-command",
+                "status": "accepted",
+                "evidence": "matching_stop_transaction",
+            })
+
+        collections["sesiones"].before_update = replace_stop_command
+        with patch.object(
+            ocpp_command_service,
+            "get_collection",
+            side_effect=collections.__getitem__,
+        ):
+            result = await ocpp_command_service.reconcile_remote_commands(
+                charger,
+                ObjectId(),
+            )
+
+        command = result["commands"][0]
+        self.assertEqual(command["status"], "unknown")
+        self.assertTrue(command["lock_retained"])
+        self.assertEqual(
+            session["remote_stop_command"]["command_id"],
+            "different-command",
+        )
+        self.assertEqual(
+            collections["logs"].insert_calls[0]["datos"]["status"],
+            "unknown",
+        )
+
+    async def test_concurrent_start_reconciliations_report_the_persisted_confirmation(self):
+        update_count = 0
+        both_updates_ready = asyncio.Event()
+
+        async def wait_for_both_updates():
+            nonlocal update_count
+            update_count += 1
+            if update_count == 2:
+                both_updates_ready.set()
+            await both_updates_ready.wait()
+
+        charger, _, collections = self._start_case(
+            before_update=wait_for_both_updates,
+        )
+        with patch.object(
+            ocpp_command_service,
+            "get_collection",
+            side_effect=collections.__getitem__,
+        ):
+            results = await asyncio.gather(
+                ocpp_command_service.reconcile_remote_commands(
+                    charger,
+                    ObjectId(),
+                ),
+                ocpp_command_service.reconcile_remote_commands(
+                    charger,
+                    ObjectId(),
+                ),
+            )
+
+        commands = [result["commands"][0] for result in results]
+        self.assertEqual([command["status"] for command in commands], [
+            "confirmed",
+            "confirmed",
+        ])
+        self.assertEqual(
+            collections["cargadores"].documents[0][
+                "last_remote_command_reconciliation"
+            ]["status"],
+            "confirmed",
+        )
+        self.assertEqual(
+            [entry["datos"]["status"] for entry in collections["logs"].insert_calls],
+            ["confirmed", "confirmed"],
+        )
+
+    async def test_concurrent_stop_reconciliations_report_the_persisted_confirmation(self):
+        update_count = 0
+        both_updates_ready = asyncio.Event()
+
+        async def wait_for_both_updates():
+            nonlocal update_count
+            update_count += 1
+            if update_count == 2:
+                both_updates_ready.set()
+            await both_updates_ready.wait()
+
+        charger, session, collections = self._stop_case(
+            finalized=True,
+            before_update=wait_for_both_updates,
+        )
+        with patch.object(
+            ocpp_command_service,
+            "get_collection",
+            side_effect=collections.__getitem__,
+        ):
+            results = await asyncio.gather(
+                ocpp_command_service.reconcile_remote_commands(
+                    charger,
+                    ObjectId(),
+                ),
+                ocpp_command_service.reconcile_remote_commands(
+                    charger,
+                    ObjectId(),
+                ),
+            )
+
+        commands = [result["commands"][0] for result in results]
+        self.assertEqual([command["status"] for command in commands], [
+            "confirmed",
+            "confirmed",
+        ])
+        self.assertEqual(
+            session["remote_stop_command"]["status"],
+            "confirmed",
+        )
+        self.assertEqual(
+            [entry["datos"]["status"] for entry in collections["logs"].insert_calls],
+            ["confirmed", "confirmed"],
+        )
+
+    async def test_duplicate_stop_confirmation_is_idempotent(self):
+        charger, session, collections = self._stop_case(finalized=True)
+        with patch.object(
+            ocpp_command_service,
+            "get_collection",
+            side_effect=collections.__getitem__,
+        ):
+            first = await ocpp_command_service.reconcile_remote_commands(
+                charger,
+                ObjectId(),
+            )
+            second = await ocpp_command_service.reconcile_remote_commands(
+                charger,
+                ObjectId(),
+            )
+
+        self.assertEqual(first["commands"][0]["status"], "confirmed")
+        self.assertEqual(second["commands"], [])
+        self.assertEqual(
+            session["remote_stop_command"]["status"],
+            "confirmed",
+        )
+        self.assertEqual(len(collections["logs"].insert_calls), 1)
+
+    async def test_remote_start_sends_expected_payload(self):
+        charger_document = {
+            "charge_point_id": "CP-1",
+            "empresa_id": ObjectId(),
+            "activo": True,
+        }
+        charger = FakeCollection(charger_document)
+        with (
+            patch.object(ocpp_command_service, "get_collection", return_value=charger),
             patch.object(
                 ocpp_command_service,
                 "_charger_exists",
                 new_callable=AsyncMock,
+                return_value=charger_document,
             ) as charger_exists,
             patch.object(
                 ocpp_command_service,
@@ -150,11 +1057,95 @@ class RemoteStopServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "Accepted")
         charger_exists.assert_awaited_once_with("CP-1")
+        self.assertEqual(
+            charger.document["pending_remote_start"]["status"],
+            "accepted",
+        )
         charge_point_id, action, payload = send.await_args.args
         self.assertEqual(action, "RemoteStartTransaction")
         self.assertEqual(charge_point_id, "CP-1")
         self.assertEqual(payload.id_tag, "TAG-1")
         self.assertEqual(payload.connector_id, 2)
+        self.assertEqual(charger.document["pending_remote_start"]["id_tag"], "TAG-1")
+
+    async def test_remote_start_timeout_is_indeterminate_and_blocks_duplicate(self):
+        charger_document = {
+            "charge_point_id": "CP-1",
+            "empresa_id": ObjectId(),
+            "activo": True,
+        }
+        charger = FakeCollection(charger_document)
+        timeout = HTTPException(
+            status_code=504,
+            detail={"outcome": "indeterminate"},
+        )
+        with (
+            patch.object(ocpp_command_service, "get_collection", return_value=charger),
+            patch.object(
+                ocpp_command_service,
+                "_charger_exists",
+                new_callable=AsyncMock,
+                return_value=charger_document,
+            ),
+            patch.object(
+                ocpp_command_service,
+                "_call",
+                new_callable=AsyncMock,
+                side_effect=timeout,
+            ) as send,
+        ):
+            with self.assertRaises(HTTPException):
+                await ocpp_command_service.remote_start("CP-1", "TAG-1", 2)
+            self.assertEqual(
+                charger.document["pending_remote_start"]["status"],
+                "indeterminate",
+            )
+            self.assertEqual(
+                charger.document["remote_start_lock"]["status"],
+                "indeterminate",
+            )
+            with self.assertRaises(HTTPException) as raised:
+                await ocpp_command_service.remote_start("CP-1", "TAG-1", 2)
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.detail["outcome"], "indeterminate")
+        send.assert_awaited_once()
+
+    async def test_remote_start_can_be_retried_after_definitive_rejection(self):
+        charger_document = {
+            "charge_point_id": "CP-1",
+            "empresa_id": ObjectId(),
+            "activo": True,
+        }
+        charger = FakeCollection(charger_document)
+        with (
+            patch.object(ocpp_command_service, "get_collection", return_value=charger),
+            patch.object(
+                ocpp_command_service,
+                "_charger_exists",
+                new_callable=AsyncMock,
+                return_value=charger_document,
+            ),
+            patch.object(
+                ocpp_command_service,
+                "_call",
+                new_callable=AsyncMock,
+                side_effect=[
+                    {"status": "Rejected"},
+                    {"status": "Accepted"},
+                ],
+            ) as send,
+        ):
+            rejected = await ocpp_command_service.remote_start("CP-1", "TAG-1", 1)
+            accepted = await ocpp_command_service.remote_start("CP-1", "TAG-1", 1)
+
+        self.assertEqual(rejected["status"], "Rejected")
+        self.assertEqual(accepted["status"], "Accepted")
+        self.assertEqual(send.await_count, 2)
+        self.assertEqual(
+            charger.document["pending_remote_start"]["status"],
+            "accepted",
+        )
 
     async def test_reset_sends_requested_reset_type(self):
         with (
@@ -177,6 +1168,28 @@ class RemoteStopServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(action, "Reset")
         self.assertEqual(charge_point_id, "CP-1")
         self.assertEqual(payload.type.value, "Hard")
+
+    async def test_reset_sends_soft_reset_type(self):
+        with (
+            patch.object(
+                ocpp_command_service,
+                "_charger_exists",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                ocpp_command_service,
+                "_call",
+                new_callable=AsyncMock,
+                return_value={"status": "Accepted"},
+            ) as send,
+        ):
+            result = await ocpp_command_service.reset("CP-1", "Soft")
+
+        self.assertEqual(result["status"], "Accepted")
+        charge_point_id, action, payload = send.await_args.args
+        self.assertEqual(action, "Reset")
+        self.assertEqual(charge_point_id, "CP-1")
+        self.assertEqual(payload.type.value, "Soft")
 
     async def test_change_availability_sends_requested_connector_and_type(self):
         with (
@@ -215,6 +1228,47 @@ class RemoteStopServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raised.exception.status_code, 404)
         send.assert_not_awaited()
 
+    async def test_remote_stop_sends_matching_transaction_id(self):
+        sessions = FakeCollection(active_session())
+        with (
+            patch.object(
+                ocpp_command_service,
+                "get_collection",
+                return_value=sessions,
+            ),
+            patch.object(
+                ocpp_command_service,
+                "_call",
+                new_callable=AsyncMock,
+                return_value={"status": "Accepted"},
+            ) as send,
+        ):
+            result = await ocpp_command_service.remote_stop("CP-1", 123)
+
+        self.assertEqual(result["status"], "Accepted")
+        charge_point_id, action, payload = send.await_args.args
+        self.assertEqual(charge_point_id, "CP-1")
+        self.assertEqual(action, "RemoteStopTransaction")
+        self.assertEqual(payload.transaction_id, 123)
+
+    async def test_remote_stop_accepts_legacy_iniciada_session_state(self):
+        session = active_session()
+        session["estado"] = "iniciada"
+        sessions = FakeCollection(session)
+        with (
+            patch.object(ocpp_command_service, "get_collection", return_value=sessions),
+            patch.object(
+                ocpp_command_service,
+                "_call",
+                new_callable=AsyncMock,
+                return_value={"status": "Accepted"},
+            ) as send,
+        ):
+            result = await ocpp_command_service.remote_stop("CP-1", 123)
+
+        self.assertEqual(result["status"], "Accepted")
+        send.assert_awaited_once()
+
     async def test_disconnected_charger_is_reported(self):
         sessions = FakeCollection(active_session())
         with (
@@ -235,6 +1289,8 @@ class RemoteStopServiceTests(unittest.IsolatedAsyncioTestCase):
         disconnected = asyncio.Event()
 
         class DisconnectingHandler:
+            negotiated_subprotocol = "ocpp1.6j"
+
             async def call(self, payload, *, suppress, unique_id):
                 self.call_arguments = (payload, suppress, unique_id)
                 disconnected.set()
@@ -256,9 +1312,12 @@ class RemoteStopServiceTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(HTTPException) as raised:
                 await ocpp_command_service.remote_stop("CP-1", 123)
 
-        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.status_code, 504)
         self.assertEqual(sessions.document["estado"], "activa")
-        self.assertEqual(sessions.update_calls, [])
+        self.assertEqual(
+            sessions.document["remote_stop_command"]["status"],
+            "indeterminate",
+        )
 
     async def test_accepted_command_does_not_finalize_session(self):
         sessions = FakeCollection(active_session())
@@ -275,7 +1334,10 @@ class RemoteStopServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "Accepted")
         self.assertEqual(sessions.document["estado"], "activa")
-        self.assertEqual(sessions.update_calls, [])
+        self.assertEqual(
+            sessions.document["remote_stop_command"]["status"],
+            "accepted",
+        )
 
     async def test_rejected_command_is_reported_as_conflict(self):
         sessions = FakeCollection(active_session())
@@ -299,6 +1361,8 @@ class RemoteStopServiceTests(unittest.IsolatedAsyncioTestCase):
         sessions = FakeCollection(active_session())
 
         class HangingHandler:
+            negotiated_subprotocol = "ocpp1.6j"
+
             async def call(self, payload, *, suppress, unique_id):
                 self.call_arguments = (payload, suppress, unique_id)
                 await asyncio.Event().wait()
@@ -326,13 +1390,45 @@ class RemoteStopServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.status_code, 504)
         self.assertEqual(sessions.document["estado"], "activa")
-        self.assertEqual(sessions.update_calls, [])
+        self.assertEqual(
+            raised.exception.detail["outcome"],
+            "indeterminate",
+        )
+        self.assertEqual(
+            sessions.document["remote_stop_command"]["status"],
+            "indeterminate",
+        )
+
+    async def test_indeterminate_remote_stop_cannot_be_sent_twice(self):
+        sessions = FakeCollection(active_session())
+        with (
+            patch.object(ocpp_command_service, "get_collection", return_value=sessions),
+            patch.object(
+                ocpp_command_service,
+                "_call",
+                new_callable=AsyncMock,
+                side_effect=HTTPException(
+                    status_code=504,
+                    detail={"outcome": "indeterminate"},
+                ),
+            ) as send,
+        ):
+            with self.assertRaises(HTTPException):
+                await ocpp_command_service.remote_stop("CP-1", 123)
+            with self.assertRaises(HTTPException) as raised:
+                await ocpp_command_service.remote_stop("CP-1", 123)
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.detail["outcome"], "indeterminate")
+        send.assert_awaited_once()
 
     async def test_cancelled_request_cancels_pending_charger_command(self):
         call_started = asyncio.Event()
         call_cancelled = asyncio.Event()
 
         class HangingHandler:
+            negotiated_subprotocol = "ocpp1.6j"
+
             async def call(self, payload, *, suppress, unique_id):
                 call_started.set()
                 try:
@@ -610,6 +1706,156 @@ class StopTransactionTests(unittest.IsolatedAsyncioTestCase):
         grant_reward.assert_awaited_once()
         apply_reward_again.assert_not_awaited()
         grant_reward_again.assert_not_awaited()
+
+    async def test_stop_transaction_integrates_points_retry_and_idempotency(self):
+        company_id = ObjectId()
+        user_id = ObjectId()
+        session_id = ObjectId()
+        session_document = active_session()
+        session_document.update({
+            "_id": session_id,
+            "empresa_id": company_id,
+            "usuario_id": user_id,
+            "fecha_inicio": datetime.utcnow() - timedelta(minutes=5),
+        })
+        sessions = FakeCollection(session_document)
+        charger = FakeCollection({
+            "charge_point_id": "CP-1",
+            "estado_general": "ocupado",
+            "sesion_actual": {"transaction_id": 123},
+        })
+        ocpp_collections = {
+            "sesiones": sessions,
+            "cargadores": charger,
+            "logs": FakeCollection(),
+            "eventos_ocpp": FakeCollection(),
+        }
+        reward_collections = {
+            "empresas": RewardTransactionalCollection([{
+                "_id": company_id,
+                "activo": True,
+            }]),
+            "usuarios": RewardTransactionalCollection([{
+                "_id": user_id,
+                "empresa_id": company_id,
+                "rol": "cliente",
+                "activo": True,
+                "total_cargas": 19,
+            }]),
+            "company_reward_rules": RewardTransactionalCollection([{
+                "_id": company_id,
+                "empresa_id": company_id,
+                "activa": True,
+                "puntos_por_carga": 7,
+                "energia_minima_kwh": 0.4,
+            }]),
+            "company_reward_balances": RewardTransactionalCollection(),
+            "company_reward_ledger": RewardTransactionalCollection(
+                fail_insert_once=True
+            ),
+            "recompensas": RewardTransactionalCollection(),
+            "recompensa_progreso": RewardTransactionalCollection(),
+            "recompensa_reglas": RewardTransactionalCollection([{
+                "_id": ObjectId(),
+                "activa": True,
+                "cargas_requeridas": 1,
+                "recompensa_catalogo_id": ObjectId(),
+            }]),
+            "recompensa_catalogo": RewardTransactionalCollection(),
+        }
+        reward_rule = reward_collections["recompensa_reglas"].documents[0]
+        catalog_id = reward_rule["recompensa_catalogo_id"]
+        now = datetime.utcnow()
+        reward_collections["recompensa_catalogo"].documents.append({
+            "_id": catalog_id,
+            "activa": True,
+            "fecha_inicio": now - timedelta(days=1),
+            "fecha_finalizacion": now + timedelta(days=1),
+            "nombre": "Hito 1",
+            "empresa": "Proveedor",
+            "descripcion": "Carga gratuita",
+            "condiciones": "",
+        })
+        mongo_client = RewardTransactionalClient(reward_collections)
+        history = ForbiddenHistoryCollection()
+        legacy_reward_collections = {
+            **reward_collections,
+            "sesiones": history,
+        }
+        handler = ocpp_server.ChargePointHandler("CP-1", None)
+        with (
+            patch.object(
+                ocpp_server,
+                "get_collection",
+                side_effect=ocpp_collections.__getitem__,
+            ),
+            patch.object(
+                ocpp_server,
+                "aplicar_recompensa_en_sesion",
+                new_callable=AsyncMock,
+                return_value={"tipo": "ninguna", "mensaje": ""},
+            ),
+            patch.object(
+                reward_service,
+                "get_collection",
+                side_effect=legacy_reward_collections.__getitem__,
+            ),
+            patch.object(
+                reward_service,
+                "db",
+                SimpleNamespace(client=mongo_client),
+            ),
+            patch.object(
+                company_reward_points,
+                "get_collection",
+                side_effect=reward_collections.__getitem__,
+            ),
+            patch.object(
+                company_reward_points,
+                "db",
+                SimpleNamespace(client=mongo_client),
+            ),
+        ):
+            with self.assertRaisesRegex(OperationFailure, "simulated ledger failure"):
+                await handler.on_stop_transaction(
+                    123,
+                    1500,
+                    datetime.utcnow(),
+                )
+            self.assertFalse(sessions.document["stop_closure"]["rewards_granted"])
+            self.assertEqual(reward_collections["company_reward_balances"].documents, [])
+            self.assertEqual(reward_collections["company_reward_ledger"].documents, [])
+            self.assertEqual(
+                len(reward_collections["recompensa_progreso"].documents), 2
+            )
+            self.assertEqual(len(reward_collections["recompensas"].documents), 1)
+
+            response = await handler.on_stop_transaction(
+                123,
+                1500,
+                datetime.utcnow(),
+            )
+            await handler.on_stop_transaction(123, 1500, datetime.utcnow())
+
+        self.assertEqual(response.id_tag_info["status"], "Accepted")
+        self.assertEqual(
+            reward_collections["company_reward_balances"].documents[0][
+                "puntos_disponibles"
+            ],
+            7,
+        )
+        self.assertEqual(len(reward_collections["company_reward_ledger"].documents), 1)
+        ledger_entry = reward_collections["company_reward_ledger"].documents[0]
+        self.assertEqual(ledger_entry["session_id"], session_id)
+        self.assertEqual(ledger_entry["snapshot_regla"]["puntos_por_carga"], 7)
+        self.assertEqual(ledger_entry["snapshot_regla"]["energia_sesion_kwh"], 0.5)
+        self.assertTrue(sessions.document["stop_closure"]["rewards_granted"])
+        self.assertEqual(reward_collections["usuarios"].documents[0]["total_cargas"], 19)
+        self.assertEqual(
+            len(reward_collections["recompensa_progreso"].documents), 2
+        )
+        self.assertEqual(len(reward_collections["recompensas"].documents), 1)
+        self.assertEqual(history.count_documents_calls, 0)
 
     async def test_lost_atomic_update_race_skips_rewards_and_charger_update(self):
         sessions = FakeCollection(active_session(), lose_update_race=True)
@@ -1450,7 +2696,187 @@ class RewardServiceMemoryCollection:
         return True
 
 
+class RewardTransactionalCollection:
+    def __init__(
+        self,
+        documents=None,
+        *,
+        fail_insert_once=False,
+        fail_update_once=False,
+    ):
+        self.documents = list(documents or [])
+        self.fail_insert_once = fail_insert_once
+        self.fail_update_once = fail_update_once
+
+    @classmethod
+    def _value(cls, document, path):
+        value = document
+        for part in path.split("."):
+            value = value.get(part) if isinstance(value, dict) else None
+        return value
+
+    @classmethod
+    def _matches(cls, document, query):
+        for key, expected in query.items():
+            actual = cls._value(document, key)
+            if isinstance(expected, dict):
+                for operator, value in expected.items():
+                    if operator == "$ne" and actual == value:
+                        return False
+                    if operator == "$gte" and (actual is None or actual < value):
+                        return False
+                    if operator == "$lte" and (actual is None or actual > value):
+                        return False
+            elif actual != expected:
+                return False
+        return True
+
+    async def find_one(self, query, *, session=None):
+        return next(
+            (
+                copy.deepcopy(item)
+                for item in self.documents
+                if self._matches(item, query)
+            ),
+            None,
+        )
+
+    async def count_documents(self, query, *, session=None):
+        return sum(self._matches(item, query) for item in self.documents)
+
+    def find(self, query, *, session=None):
+        async def matching_documents():
+            for item in self.documents:
+                if self._matches(item, query):
+                    yield copy.deepcopy(item)
+
+        return matching_documents()
+
+    async def insert_one(self, document, *, session=None):
+        if self.fail_insert_once:
+            self.fail_insert_once = False
+            raise OperationFailure("simulated ledger failure")
+        if any(item.get("_id") == document.get("_id") for item in self.documents):
+            raise DuplicateKeyError("duplicate key")
+        self.documents.append(copy.deepcopy(document))
+
+    async def update_one(self, query, update, *, upsert=False, session=None):
+        document = next(
+            (
+                item
+                for item in self.documents
+                if self._matches(item, query)
+            ),
+            None,
+        )
+        inserted = False
+        if document is None and upsert:
+            document = {"_id": query.get("_id", ObjectId())}
+            self.documents.append(document)
+            inserted = True
+        if document is None:
+            return SimpleNamespace(matched_count=0, modified_count=0)
+        if inserted:
+            document.update(copy.deepcopy(update.get("$setOnInsert", {})))
+        for key, value in update.get("$inc", {}).items():
+            document[key] = document.get(key, 0) + value
+        document.update(copy.deepcopy(update.get("$set", {})))
+        if self.fail_update_once:
+            self.fail_update_once = False
+            raise RuntimeError("simulated reward write acknowledgement loss")
+        return SimpleNamespace(matched_count=1, modified_count=1)
+
+
+class ForbiddenHistoryCollection:
+    def __init__(self):
+        self.count_documents_calls = 0
+
+    async def count_documents(self, query, *, session=None):
+        self.count_documents_calls += 1
+        raise AssertionError("legacy reward processing must not recount sessions")
+
+
+class RewardTransactionalSession:
+    def __init__(self, client):
+        self.client = client
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return False
+
+    async def with_transaction(self, callback):
+        async with self.client.lock:
+            snapshot = {
+                name: copy.deepcopy(collection.documents)
+                for name, collection in self.client.collections.items()
+            }
+            try:
+                return await callback(self)
+            except Exception:
+                for name, documents in snapshot.items():
+                    self.client.collections[name].documents = documents
+                raise
+
+
+class RewardTransactionalClient:
+    def __init__(self, collections):
+        self.collections = collections
+        self.lock = asyncio.Lock()
+
+    async def start_session(self):
+        return RewardTransactionalSession(self)
+
+
 class RewardServiceTests(unittest.IsolatedAsyncioTestCase):
+    def _legacy_reward_setup(
+        self,
+        usuario_id,
+        thresholds,
+        *,
+        existing_rewards=None,
+        fail_reward_update_once=False,
+    ):
+        ahora = datetime.utcnow()
+        catalog_ids = [ObjectId() for _ in thresholds]
+        rules = RewardTransactionalCollection([
+            {
+                "_id": ObjectId(),
+                "activa": True,
+                "cargas_requeridas": threshold,
+                "recompensa_catalogo_id": catalog_id,
+            }
+            for threshold, catalog_id in zip(thresholds, catalog_ids)
+        ])
+        catalog = RewardTransactionalCollection([
+            {
+                "_id": catalog_id,
+                "activa": True,
+                "fecha_inicio": ahora - timedelta(days=1),
+                "fecha_finalizacion": ahora + timedelta(days=1),
+                "nombre": f"Recompensa {index}",
+                "empresa": "Proveedor",
+                "descripcion": "Beneficio",
+                "condiciones": "",
+            }
+            for index, catalog_id in enumerate(catalog_ids, 1)
+        ])
+        collections = {
+            "usuarios": RewardTransactionalCollection([{
+                "_id": usuario_id,
+                "total_cargas": 19,
+            }]),
+            "recompensas": RewardTransactionalCollection(
+                existing_rewards,
+                fail_update_once=fail_reward_update_once,
+            ),
+            "recompensa_progreso": RewardTransactionalCollection(),
+            "recompensa_reglas": rules,
+            "recompensa_catalogo": catalog,
+        }
+        return collections, RewardTransactionalClient(collections), ForbiddenHistoryCollection()
+
     async def test_apply_retry_recovers_reward_claim_without_consuming_another(self):
         usuario_id = ObjectId()
         sesion_id = ObjectId()
@@ -1549,161 +2975,436 @@ class RewardServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(session["es_carga_gratuita"])
         self.assertIsNone(session["beneficio_aplicado"])
 
-    async def test_grant_retry_after_insert_ack_loss_does_not_duplicate_reward(self):
+    async def test_grant_retry_after_transactional_write_failure_is_atomic(self):
         usuario_id = ObjectId()
-        regla_id = ObjectId()
-        catalogo_id = ObjectId()
-        ahora = datetime.utcnow()
-        users = RewardServiceMemoryCollection([{"_id": usuario_id}])
-        sessions = RewardServiceMemoryCollection([{
+        sesion = {
             "_id": ObjectId(),
             "usuario_id": usuario_id,
             "estado": "finalizada",
-        }])
-        rewards = RewardServiceMemoryCollection(fail_after_upsert_once=True)
-        rules = RewardServiceMemoryCollection([{
-            "_id": regla_id,
-            "activa": True,
-            "cargas_requeridas": 1,
-            "recompensa_catalogo_id": catalogo_id,
-        }])
-        catalog = RewardServiceMemoryCollection([{
-            "_id": catalogo_id,
-            "activa": True,
-            "fecha_inicio": ahora - timedelta(days=1),
-            "fecha_finalizacion": ahora + timedelta(days=1),
-            "nombre": "Carga",
-            "empresa": "Proveedor",
-            "descripcion": "Carga gratuita",
-            "condiciones": "",
-        }])
-        collections = {
-            "usuarios": users,
-            "sesiones": sessions,
-            "recompensas": rewards,
-            "recompensa_reglas": rules,
-            "recompensa_catalogo": catalog,
+            "fecha_fin": datetime.utcnow(),
+            "stop_closure": {"rewards_granted": False},
         }
+        collections, mongo_client, history = self._legacy_reward_setup(
+            usuario_id, [1], fail_reward_update_once=True
+        )
+        lookup = {**collections, "sesiones": history}
 
         with patch.object(
-            reward_service, "get_collection", side_effect=collections.__getitem__
+            reward_service, "get_collection", side_effect=lookup.__getitem__
+        ), patch.object(
+            reward_service, "db", SimpleNamespace(client=mongo_client)
         ):
-            with self.assertRaisesRegex(RuntimeError, "acknowledgement lost"):
-                await reward_service.verificar_y_otorgar_recompensa(
-                    str(usuario_id)
-                )
-            await reward_service.verificar_y_otorgar_recompensa(str(usuario_id))
+            with self.assertRaisesRegex(RuntimeError, "acknowledgement loss"):
+                await reward_service.verificar_y_otorgar_recompensa(sesion)
+            self.assertEqual(
+                await reward_service.verificar_y_otorgar_recompensa(sesion), 1
+            )
 
-        self.assertEqual(users.documents[0]["total_cargas"], 1)
-        self.assertEqual(len(rewards.documents), 1)
-        self.assertEqual(rewards.documents[0]["usuario_id"], usuario_id)
-        self.assertEqual(rewards.documents[0]["recompensa_regla_id"], regla_id)
+        self.assertEqual(collections["usuarios"].documents[0]["total_cargas"], 19)
+        self.assertEqual(len(collections["recompensas"].documents), 1)
+        self.assertEqual(
+            collections["recompensas"].documents[0]["usuario_id"], usuario_id
+        )
+        self.assertEqual(len(collections["recompensa_progreso"].documents), 2)
+        self.assertEqual(history.count_documents_calls, 0)
+
+
+    def _case(self, handler_type, *, fail_legacy=False, fail_points=False):
+        company_id = ObjectId()
+        user_id = ObjectId()
+        session_id = ObjectId()
+        session_document = active_session()
+        session_document.update({
+            "_id": session_id,
+            "empresa_id": company_id,
+            "usuario_id": user_id,
+            "ocpp_transaction_id": "opaque-transaction",
+            "meter_start": 0,
+            "fecha_inicio": datetime.utcnow() - timedelta(minutes=5),
+        })
+        sessions = FakeCollection(session_document)
+        charger = FakeCollection({
+            "charge_point_id": "CP-1",
+            "estado_general": "ocupado",
+            "sesion_actual": {"transaction_id": 123},
+        })
+        ocpp_collections = {
+            "sesiones": sessions,
+            "cargadores": charger,
+            "logs": FakeCollection(),
+            "eventos_ocpp": FakeCollection(),
+        }
+
+        now = datetime.utcnow()
+        rule_id = ObjectId()
+        catalog_id = ObjectId()
+        reward_collections = {
+            "empresas": RewardTransactionalCollection([{
+                "_id": company_id,
+                "activo": True,
+            }]),
+            "usuarios": RewardTransactionalCollection([{
+                "_id": user_id,
+                "empresa_id": company_id,
+                "rol": "cliente",
+                "activo": True,
+                "total_cargas": 19,
+            }]),
+            "company_reward_rules": RewardTransactionalCollection([{
+                "_id": company_id,
+                "empresa_id": company_id,
+                "activa": True,
+                "puntos_por_carga": 7,
+                "energia_minima_kwh": 0,
+            }]),
+            "company_reward_balances": RewardTransactionalCollection(),
+            "company_reward_ledger": RewardTransactionalCollection(
+                fail_insert_once=fail_points
+            ),
+            "recompensas": RewardTransactionalCollection(
+                fail_update_once=fail_legacy
+            ),
+            "recompensa_progreso": RewardTransactionalCollection(),
+            "recompensa_reglas": RewardTransactionalCollection([{
+                "_id": rule_id,
+                "activa": True,
+                "cargas_requeridas": 1,
+                "recompensa_catalogo_id": catalog_id,
+            }]),
+            "recompensa_catalogo": RewardTransactionalCollection([{
+                "_id": catalog_id,
+                "activa": True,
+                "fecha_inicio": now - timedelta(days=1),
+                "fecha_finalizacion": now + timedelta(days=1),
+                "nombre": "Hito de prueba",
+                "empresa": "ChargeCore",
+                "descripcion": "Recompensa",
+                "condiciones": "",
+            }]),
+        }
+        mongo_client = RewardTransactionalClient(reward_collections)
+        reward_lookups = {**reward_collections, "sesiones": sessions}
+        handler = handler_type(
+            "CP-1",
+            None,
+            None,
+            ocpp_server.ChargePointHandler("CP-1", None),
+        )
+        patches = (
+            patch.object(
+                ocpp_v201,
+                "get_collection",
+                return_value=sessions,
+            ),
+            patch.object(
+                ocpp_server,
+                "get_collection",
+                side_effect=ocpp_collections.__getitem__,
+            ),
+            patch.object(
+                reward_service,
+                "get_collection",
+                side_effect=reward_lookups.__getitem__,
+            ),
+            patch.object(
+                reward_service,
+                "db",
+                SimpleNamespace(client=mongo_client),
+            ),
+            patch.object(
+                company_reward_points,
+                "get_collection",
+                side_effect=reward_collections.__getitem__,
+            ),
+            patch.object(
+                company_reward_points,
+                "db",
+                SimpleNamespace(client=mongo_client),
+            ),
+        )
+        return (
+            handler,
+            sessions,
+            charger,
+            ocpp_collections,
+            reward_collections,
+            patches,
+        )
+
+    @staticmethod
+    async def _send_ended(handler):
+        return await handler.on_transaction_event(
+            "Ended",
+            datetime.utcnow().isoformat(),
+            "EVDeparted",
+            1,
+            {
+                "transaction_id": "opaque-transaction",
+                "stopped_reason": "EVDeparted",
+            },
+        )
+
+    async def test_ocpp_201_and_21_normal_ended_apply_both_reward_systems(self):
+        for handler_type in (OCPP201ChargePointHandler, OCPP21ChargePointHandler):
+            with self.subTest(protocol=handler_type.negotiated_subprotocol):
+                (
+                    handler,
+                    sessions,
+                    _charger,
+                    _ocpp_collections,
+                    rewards,
+                    patches,
+                ) = self._case(handler_type)
+                with (
+                    patches[0],
+                    patches[1],
+                    patches[2],
+                    patches[3],
+                    patches[4],
+                    patches[5],
+                ):
+                    response = await self._send_ended(handler)
+
+                self.assertIsNotNone(response)
+                self.assertEqual(sessions.document["estado"], "finalizada")
+                self.assertTrue(sessions.document["stop_closure"]["rewards_granted"])
+                self.assertEqual(
+                    next(iter(rewards["recompensa_progreso"].documents))[
+                        "cargas_nuevas"
+                    ],
+                    1,
+                )
+                self.assertEqual(len(rewards["recompensas"].documents), 1)
+                self.assertEqual(
+                    rewards["company_reward_balances"].documents[0][
+                        "puntos_disponibles"
+                    ],
+                    7,
+                )
+                self.assertEqual(len(rewards["company_reward_ledger"].documents), 1)
+                self.assertEqual(rewards["usuarios"].documents[0]["total_cargas"], 19)
+
+    async def test_ended_retry_recovers_legacy_reward_failure_without_new_session(self):
+        (
+            handler,
+            sessions,
+            _charger,
+            _ocpp_collections,
+            rewards,
+            patches,
+        ) = self._case(OCPP201ChargePointHandler, fail_legacy=True)
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "simulated reward write"):
+                await self._send_ended(handler)
+            saved_close = {
+                key: sessions.document.get(key)
+                for key in ("energia_consumida_kwh", "duracion_minutos", "fecha_fin")
+            }
+            response = await self._send_ended(handler)
+
+        self.assertIsNotNone(response)
+        self.assertEqual(sessions.document["estado"], "finalizada")
+        self.assertEqual(
+            {
+                key: sessions.document.get(key)
+                for key in ("energia_consumida_kwh", "duracion_minutos", "fecha_fin")
+            },
+            saved_close,
+        )
+        self.assertEqual(len(rewards["recompensa_progreso"].documents), 2)
+        self.assertEqual(len(rewards["recompensas"].documents), 1)
+        self.assertEqual(len(rewards["company_reward_ledger"].documents), 1)
+        self.assertEqual(rewards["usuarios"].documents[0]["total_cargas"], 19)
+        self.assertEqual(len(sessions.insert_calls), 0)
+
+    async def test_ended_retry_after_points_failure_does_not_duplicate_legacy_reward(self):
+        (
+            handler,
+            sessions,
+            _charger,
+            _ocpp_collections,
+            rewards,
+            patches,
+        ) = self._case(OCPP21ChargePointHandler, fail_points=True)
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patches[5],
+        ):
+            with self.assertRaisesRegex(OperationFailure, "simulated ledger failure"):
+                await self._send_ended(handler)
+            saved_close = (
+                sessions.document["energia_consumida_kwh"],
+                sessions.document["duracion_minutos"],
+                sessions.document["fecha_fin"],
+            )
+            responses = await asyncio.gather(
+                self._send_ended(handler),
+                self._send_ended(handler),
+            )
+            duplicate_response = await self._send_ended(handler)
+
+        self.assertTrue(all(response is not None for response in responses))
+        self.assertIsNotNone(duplicate_response)
+        self.assertEqual(sessions.document["estado"], "finalizada")
+        self.assertEqual(
+            (
+                sessions.document["energia_consumida_kwh"],
+                sessions.document["duracion_minutos"],
+                sessions.document["fecha_fin"],
+            ),
+            saved_close,
+        )
+        self.assertTrue(sessions.document["stop_closure"]["rewards_granted"])
+        self.assertEqual(len(rewards["recompensa_progreso"].documents), 2)
+        self.assertEqual(
+            next(
+                item for item in rewards["recompensa_progreso"].documents
+                if item["_id"] == sessions.document["usuario_id"]
+            )["cargas_nuevas"],
+            1,
+        )
+        self.assertEqual(len(rewards["recompensas"].documents), 1)
+        self.assertEqual(len(rewards["company_reward_ledger"].documents), 1)
+        self.assertEqual(
+            rewards["company_reward_balances"].documents[0][
+                "puntos_disponibles"
+            ],
+            7,
+        )
+        self.assertEqual(rewards["usuarios"].documents[0]["total_cargas"], 19)
+        self.assertEqual(len(sessions.insert_calls), 0)
 
     async def test_grants_every_active_reward_rule_for_the_completed_load_count(self):
         usuario_id = ObjectId()
-        catalogo_ids = [ObjectId(), ObjectId()]
-        regla_ids = [ObjectId(), ObjectId()]
-        ahora = datetime.utcnow()
-        users = RewardServiceMemoryCollection([{"_id": usuario_id}])
-        sessions = RewardServiceMemoryCollection([
+        sesion = {
+            "_id": ObjectId(),
+            "usuario_id": usuario_id,
+            "estado": "finalizada",
+            "fecha_fin": datetime.utcnow(),
+            "stop_closure": {"rewards_granted": False},
+        }
+        collections, mongo_client, history = self._legacy_reward_setup(
+            usuario_id, [1, 1]
+        )
+        lookup = {**collections, "sesiones": history}
+
+        with patch.object(
+            reward_service, "get_collection", side_effect=lookup.__getitem__
+        ), patch.object(
+            reward_service, "db", SimpleNamespace(client=mongo_client)
+        ):
+            await reward_service.verificar_y_otorgar_recompensa(sesion)
+
+        self.assertEqual(len(collections["recompensas"].documents), 2)
+        self.assertEqual(
+            {
+                reward["recompensa_regla_id"]
+                for reward in collections["recompensas"].documents
+            },
+            {rule["_id"] for rule in collections["recompensa_reglas"].documents},
+        )
+        self.assertTrue(all(
+            reward["usado"] is False
+            for reward in collections["recompensas"].documents
+        ))
+        self.assertEqual(history.count_documents_calls, 0)
+
+    async def test_concurrent_new_sessions_increment_once_and_grant_milestone(self):
+        usuario_id = ObjectId()
+        collections, mongo_client, history = self._legacy_reward_setup(
+            usuario_id, [2]
+        )
+        lookup = {**collections, "sesiones": history}
+        sesiones = [
             {
                 "_id": ObjectId(),
                 "usuario_id": usuario_id,
                 "estado": "finalizada",
-            },
-        ])
-        rewards = RewardServiceMemoryCollection()
-        rules = RewardServiceMemoryCollection([
-            {
-                "_id": regla_id,
-                "activa": True,
-                "cargas_requeridas": 1,
-                "recompensa_catalogo_id": catalogo_id,
+                "fecha_fin": datetime.utcnow(),
+                "stop_closure": {"rewards_granted": False},
             }
-            for regla_id, catalogo_id in zip(regla_ids, catalogo_ids)
-        ])
-        catalog = RewardServiceMemoryCollection([
-            {
-                "_id": catalogo_id,
-                "activa": True,
-                "fecha_inicio": ahora - timedelta(days=1),
-                "fecha_finalizacion": ahora + timedelta(days=1),
-                "nombre": f"Recompensa {index}",
-                "empresa": "Proveedor",
-                "descripcion": "Beneficio",
-                "condiciones": "",
-            }
-            for index, catalogo_id in enumerate(catalogo_ids, 1)
-        ])
-        collections = {
-            "usuarios": users,
-            "sesiones": sessions,
-            "recompensas": rewards,
-            "recompensa_reglas": rules,
-            "recompensa_catalogo": catalog,
-        }
+            for _ in range(2)
+        ]
 
         with patch.object(
-            reward_service, "get_collection", side_effect=collections.__getitem__
+            reward_service, "get_collection", side_effect=lookup.__getitem__
+        ), patch.object(
+            reward_service, "db", SimpleNamespace(client=mongo_client)
         ):
-            await reward_service.verificar_y_otorgar_recompensa(str(usuario_id))
+            await asyncio.gather(*(
+                reward_service.verificar_y_otorgar_recompensa(sesion)
+                for sesion in sesiones
+            ))
 
-        self.assertEqual(len(rewards.documents), 2)
-        self.assertEqual(
-            {reward["recompensa_regla_id"] for reward in rewards.documents},
-            set(regla_ids),
+        self.assertEqual(len(collections["recompensa_progreso"].documents), 3)
+        progress = next(
+            document
+            for document in collections["recompensa_progreso"].documents
+            if document["_id"] == usuario_id
         )
-        self.assertTrue(all(reward["usado"] is False for reward in rewards.documents))
+        self.assertEqual(progress["cargas_nuevas"], 2)
+        self.assertEqual(len(collections["recompensas"].documents), 1)
+        self.assertEqual(
+            collections["recompensas"].documents[0]["cargas_requeridas"], 2
+        )
+        self.assertEqual(
+            collections["recompensas"].documents[0]["cargas_acumuladas"], 2
+        )
+        self.assertEqual(history.count_documents_calls, 0)
 
-    async def test_grants_a_missed_milestone_once_after_concurrent_session_closures(self):
+    async def test_repeated_session_preserves_existing_historical_reward(self):
         usuario_id = ObjectId()
         regla_id = ObjectId()
-        catalogo_id = ObjectId()
-        ahora = datetime.utcnow()
-        users = RewardServiceMemoryCollection([{"_id": usuario_id}])
-        sessions = RewardServiceMemoryCollection([
-            {
-                "_id": ObjectId(),
-                "usuario_id": usuario_id,
-                "estado": "finalizada",
-            }
-            for _ in range(3)
-        ])
-        rewards = RewardServiceMemoryCollection()
-        rules = RewardServiceMemoryCollection([{
-            "_id": regla_id,
-            "activa": True,
-            "cargas_requeridas": 2,
-            "recompensa_catalogo_id": catalogo_id,
-        }])
-        catalog = RewardServiceMemoryCollection([{
-            "_id": catalogo_id,
-            "activa": True,
-            "fecha_inicio": ahora - timedelta(days=1),
-            "fecha_finalizacion": ahora + timedelta(days=1),
-            "nombre": "Hito 2",
-            "empresa": "Proveedor",
-            "descripcion": "Beneficio",
-            "condiciones": "",
-        }])
-        collections = {
-            "usuarios": users,
-            "sesiones": sessions,
-            "recompensas": rewards,
-            "recompensa_reglas": rules,
-            "recompensa_catalogo": catalog,
+        existing_reward = {
+            "_id": ObjectId(),
+            "usuario_id": usuario_id,
+            "recompensa_regla_id": regla_id,
+            "cargas_requeridas": 1,
+            "cargas_acumuladas": 9,
+            "snapshot_nombre": "Histórica",
+            "usado": True,
+        }
+        collections, mongo_client, history = self._legacy_reward_setup(
+            usuario_id, [1], existing_rewards=[existing_reward]
+        )
+        collections["recompensa_reglas"].documents[0]["_id"] = regla_id
+        lookup = {**collections, "sesiones": history}
+        sesion = {
+            "_id": ObjectId(),
+            "usuario_id": usuario_id,
+            "estado": "finalizada",
+            "fecha_fin": datetime.utcnow(),
+            "stop_closure": {"rewards_granted": False},
         }
 
         with patch.object(
-            reward_service, "get_collection", side_effect=collections.__getitem__
+            reward_service, "get_collection", side_effect=lookup.__getitem__
+        ), patch.object(
+            reward_service, "db", SimpleNamespace(client=mongo_client)
         ):
-            await reward_service.verificar_y_otorgar_recompensa(str(usuario_id))
-            await reward_service.verificar_y_otorgar_recompensa(str(usuario_id))
+            first_progress = await reward_service.verificar_y_otorgar_recompensa(
+                sesion
+            )
+            retry_progress = await reward_service.verificar_y_otorgar_recompensa(
+                sesion
+            )
 
-        self.assertEqual(len(rewards.documents), 1)
-        self.assertEqual(rewards.documents[0]["cargas_requeridas"], 2)
-        self.assertEqual(rewards.documents[0]["cargas_acumuladas"], 3)
-        self.assertEqual(rewards.documents[0]["snapshot_nombre"], "Hito 2")
+        self.assertEqual(first_progress, 1)
+        self.assertEqual(retry_progress, 1)
+        self.assertEqual(len(collections["recompensa_progreso"].documents), 2)
+        self.assertEqual(collections["recompensas"].documents, [existing_reward])
+        self.assertEqual(history.count_documents_calls, 0)
 
 
 class StartTransactionCollection:
@@ -1735,7 +3436,7 @@ class StartTransactionCollection:
         if self.find_error:
             raise self.find_error
         for document in self.documents:
-            if all(self._get_path(document, key) == value for key, value in query.items()):
+            if self._matches(document, query):
                 return document.copy()
         return None
 
@@ -1743,7 +3444,7 @@ class StartTransactionCollection:
         documents = [
             document.copy()
             for document in self.documents
-            if all(self._get_path(document, key) == value for key, value in query.items())
+            if self._matches(document, query)
         ]
         return MemoryAsyncCursor(documents)
 
@@ -1776,7 +3477,7 @@ class StartTransactionCollection:
         if self.update_error:
             raise self.update_error
         for document in self.documents:
-            if all(self._get_path(document, key) == value for key, value in query.items()):
+            if self._matches(document, query):
                 if session:
                     session.record_write()
                 for path, value in update.get("$set", {}).items():
@@ -1785,6 +3486,17 @@ class StartTransactionCollection:
                     for part in parts[:-1]:
                         target = target.setdefault(part, {})
                     target[parts[-1]] = value
+                for path, value in update.get("$inc", {}).items():
+                    document[path] = document.get(path, 0) + value
+                for path in update.get("$unset", {}):
+                    parts = path.split(".")
+                    target = document
+                    for part in parts[:-1]:
+                        target = target.get(part, {})
+                        if not isinstance(target, dict):
+                            break
+                    if isinstance(target, dict):
+                        target.pop(parts[-1], None)
                 return SimpleNamespace(matched_count=1, modified_count=1)
         return SimpleNamespace(matched_count=0, modified_count=0)
 
@@ -1796,6 +3508,35 @@ class StartTransactionCollection:
                 return None
             value = value.get(part)
         return value
+
+    @classmethod
+    def _matches(cls, document, query):
+        for key, value in query.items():
+            if key == "$and":
+                if not all(cls._matches(document, clause) for clause in value):
+                    return False
+            elif key == "$or":
+                if not any(cls._matches(document, clause) for clause in value):
+                    return False
+            elif isinstance(value, dict) and "$exists" in value:
+                exists = cls._path_exists(document, key)
+                if exists != value["$exists"]:
+                    return False
+            elif isinstance(value, dict) and "$ne" in value:
+                if cls._get_path(document, key) == value["$ne"]:
+                    return False
+            elif cls._get_path(document, key) != value:
+                return False
+        return True
+
+    @staticmethod
+    def _path_exists(document, path):
+        value = document
+        for part in path.split("."):
+            if not isinstance(value, dict) or part not in value:
+                return False
+            value = value[part]
+        return True
 
 
 class StartTransactionTestCoordinator:
@@ -1924,25 +3665,44 @@ class MemoryAsyncCursor:
 
 class StartTransactionTests(unittest.IsolatedAsyncioTestCase):
     def _collections(self, sessions, charger=None):
+        company_id = ObjectId()
+        charger_collection = charger or StartTransactionCollection([{
+            "charge_point_id": "CP-1",
+            "activo": True,
+            "estado_general": "disponible",
+            "sesion_actual": None,
+        }])
+        for document in charger_collection.documents:
+            document.setdefault("empresa_id", company_id)
+            document.setdefault("activo", True)
         collections = {
+            "empresas": StartTransactionCollection([{
+                "_id": company_id,
+                "activo": True,
+            }]),
             "nfc_cards": StartTransactionCollection([{
                 "_id": "card-1",
                 "uid": "TAG-1",
                 "estado": "activa",
                 "usuario_id": "user-1",
+                "empresa_id": company_id,
             }]),
             "usuarios": StartTransactionCollection([{
                 "_id": "user-1",
                 "activo": True,
+                "rol": "cliente",
+                "empresa_id": company_id,
             }]),
             "vehiculos": StartTransactionCollection([{
                 "_id": "vehicle-1",
                 "usuario_id": "user-1",
                 "activo": True,
+                "empresa_id": company_id,
             }]),
             "nfc_charge_requests": StartTransactionCollection([{
                 "_id": "request-1",
                 "charge_point_id": "CP-1",
+                "empresa_id": company_id,
                 "uid": "TAG-1",
                 "usuario_id": "user-1",
                 "status": "start_requested",
@@ -1951,11 +3711,7 @@ class StartTransactionTests(unittest.IsolatedAsyncioTestCase):
                 "expires_at": datetime.utcnow() + timedelta(minutes=2),
             }]),
             "sesiones": sessions,
-            "cargadores": charger or StartTransactionCollection([{
-                "charge_point_id": "CP-1",
-                "estado_general": "disponible",
-                "sesion_actual": None,
-            }]),
+            "cargadores": charger_collection,
             "eventos_ocpp": StartTransactionCollection(),
         }
         for name, collection in collections.items():
@@ -1983,7 +3739,18 @@ class StartTransactionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_charger_without_active_session_starts_normally(self):
         sessions = StartTransactionCollection()
-        collections = self._collections(sessions)
+        charger = StartTransactionCollection([{
+            "_id": ObjectId(),
+            "charge_point_id": "CP-1",
+            "estado_general": "disponible",
+            "sesion_actual": None,
+            "pending_remote_start": {
+                "id_tag": "TAG-1",
+                "connector_id": 1,
+                "command_id": "pending-command",
+            },
+        }])
+        collections = self._collections(sessions, charger)
 
         response, next_id = await self._send_start(collections)
 
@@ -1991,16 +3758,34 @@ class StartTransactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.id_tag_info["status"], "Accepted")
         self.assertEqual(len(sessions.insert_calls), 1)
         self.assertEqual(sessions.insert_calls[0]["charge_point_id"], "CP-1")
+        self.assertNotIn("pending_remote_start", charger.documents[0])
         self.assertEqual(sessions.insert_calls[0]["estado"], "activa")
         self.assertEqual(sessions.insert_calls[0]["meter_start"], 1000)
-        self.assertEqual(len(collections["cargadores"].update_calls), 1)
+        self.assertEqual(len(collections["cargadores"].update_calls), 2)
         self.assertEqual(
             collections["cargadores"].update_calls[0][1]["$set"]["sesion_actual"][
                 "transaction_id"
             ],
             456,
         )
+        self.assertEqual(
+            collections["empresas"].documents[0]["owner_change_version"],
+            1,
+        )
         next_id.assert_awaited_once()
+
+    async def test_company_deactivated_before_commit_rejects_ocpp_start(self):
+        sessions = StartTransactionCollection()
+        collections = self._collections(sessions)
+        collections["empresas"].documents[0]["activo"] = False
+
+        response, next_id = await self._send_start(collections)
+
+        self.assertEqual(response.transaction_id, 0)
+        self.assertEqual(response.id_tag_info["status"], "Invalid")
+        self.assertEqual(sessions.documents, [])
+        self.assertEqual(collections["empresas"].documents[0].get("owner_change_version", 0), 0)
+        next_id.assert_not_awaited()
 
     async def test_existing_active_session_rejects_start_without_changes(self):
         existing_session = {
@@ -2024,8 +3809,8 @@ class StartTransactionTests(unittest.IsolatedAsyncioTestCase):
         sessions = StartTransactionCollection([existing_session])
         charger = StartTransactionCollection([charger_document.copy()])
         original_session = existing_session.copy()
-        original_charger = charger_document.copy()
         collections = self._collections(sessions, charger)
+        original_charger = copy.deepcopy(charger.documents[0])
 
         response, next_id = await self._send_start(collections)
 
@@ -2150,13 +3935,27 @@ class StartTransactionTests(unittest.IsolatedAsyncioTestCase):
         charger.name = "cargadores"
         collections = self._collections(sessions, charger)
 
-        with self.assertRaisesRegex(RuntimeError, "No se encontró el cargador CP-1"):
-            await self._send_start(collections)
+        response, next_id = await self._send_start(collections)
 
+        self.assertEqual(response.transaction_id, 0)
+        self.assertEqual(response.id_tag_info["status"], "Invalid")
+        next_id.assert_not_awaited()
         self.assertEqual(sessions.documents, [])
         self.assertEqual(sessions.insert_calls, [])
-        self.assertEqual(charger.update_calls[0][0], {"charge_point_id": "CP-1"})
-        self.assertEqual(collections["eventos_ocpp"].insert_calls, [])
+        self.assertEqual(charger.update_calls, [])
+        self.assertEqual(len(collections["eventos_ocpp"].insert_calls), 1)
+
+    async def test_unassigned_historical_charger_cannot_start_a_transaction(self):
+        sessions = StartTransactionCollection()
+        collections = self._collections(sessions)
+        collections["cargadores"].documents[0].pop("empresa_id")
+
+        response, next_id = await self._send_start(collections)
+
+        self.assertEqual(response.transaction_id, 0)
+        self.assertEqual(response.id_tag_info["status"], "Invalid")
+        self.assertEqual(sessions.insert_calls, [])
+        next_id.assert_not_awaited()
 
     async def test_event_failure_rolls_back_session_and_charger_updates(self):
         sessions = StartTransactionCollection()
@@ -2416,23 +4215,40 @@ class OCPPBasicHandlerTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_authorize_accepts_only_active_cards_and_records_each_result(self):
+        company_id = ObjectId()
         card = {
             "_id": "card-1",
             "uid": "TAG-1",
             "estado": "activa",
             "usuario_id": "user-1",
+            "empresa_id": company_id,
         }
         cards = StartTransactionCollection([card])
         events = StartTransactionCollection()
-        users = StartTransactionCollection([{"_id": "user-1", "activo": True}])
+        users = StartTransactionCollection([{
+            "_id": "user-1",
+            "activo": True,
+            "rol": "cliente",
+            "empresa_id": company_id,
+        }])
         requests = StartTransactionCollection([{
             "charge_point_id": "CP-1",
+            "empresa_id": company_id,
             "uid": "TAG-1",
             "usuario_id": "user-1",
             "status": "start_requested",
             "expires_at": datetime.utcnow() + timedelta(minutes=2),
         }])
         collections = {
+            "empresas": StartTransactionCollection([{
+                "_id": company_id,
+                "activo": True,
+            }]),
+            "cargadores": StartTransactionCollection([{
+                "charge_point_id": "CP-1",
+                "empresa_id": company_id,
+                "activo": True,
+            }]),
             "nfc_cards": cards,
             "usuarios": users,
             "nfc_charge_requests": requests,
@@ -2456,8 +4272,190 @@ class OCPPBasicHandlerTests(unittest.IsolatedAsyncioTestCase):
             ["Accepted", "Invalid", "Invalid"],
         )
 
+    async def test_authorize_rejects_card_for_inactive_user(self):
+        company_id = ObjectId()
+        cards = StartTransactionCollection([{
+            "_id": "card-inactive-user",
+            "uid": "TAG-INACTIVE-USER",
+            "estado": "activa",
+            "usuario_id": "inactive-user",
+            "empresa_id": company_id,
+        }])
+        users = StartTransactionCollection([{
+            "_id": "inactive-user",
+            "activo": False,
+            "rol": "cliente",
+            "empresa_id": company_id,
+        }])
+        events = StartTransactionCollection()
+        requests = StartTransactionCollection()
+        collections = {
+            "empresas": StartTransactionCollection([{
+                "_id": company_id,
+                "activo": True,
+            }]),
+            "cargadores": StartTransactionCollection([{
+                "charge_point_id": "CP-1",
+                "empresa_id": company_id,
+                "activo": True,
+            }]),
+            "nfc_cards": cards,
+            "usuarios": users,
+            "nfc_charge_requests": requests,
+            "eventos_ocpp": events,
+        }
+        handler = ocpp_server.ChargePointHandler("CP-1", None)
+
+        with patch.object(
+            ocpp_server, "get_collection", side_effect=collections.__getitem__
+        ):
+            response = await handler.on_authorize("TAG-INACTIVE-USER")
+
+        self.assertEqual(response.id_tag_info["status"], "Invalid")
+        self.assertEqual(requests.insert_calls, [])
+        self.assertEqual(
+            [event["payload"]["resultado"] for event in events.documents],
+            ["Invalid"],
+        )
+
+    async def test_authorize_rejects_unassigned_historical_charger(self):
+        cards = StartTransactionCollection([{
+            "_id": "card-unassigned",
+            "uid": "TAG-UNASSIGNED",
+            "estado": "activa",
+            "usuario_id": "user-unassigned",
+        }])
+        users = StartTransactionCollection([{
+            "_id": "user-unassigned",
+            "activo": True,
+            "rol": "cliente",
+        }])
+        events = StartTransactionCollection()
+        collections = {
+            "empresas": StartTransactionCollection(),
+            "cargadores": StartTransactionCollection([{
+                "charge_point_id": "CP-1",
+                "activo": True,
+            }]),
+            "nfc_cards": cards,
+            "usuarios": users,
+            "nfc_charge_requests": StartTransactionCollection(),
+            "eventos_ocpp": events,
+        }
+        handler = ocpp_server.ChargePointHandler("CP-1", None)
+
+        with patch.object(
+            ocpp_server, "get_collection", side_effect=collections.__getitem__
+        ):
+            response = await handler.on_authorize("TAG-UNASSIGNED")
+
+        self.assertEqual(response.id_tag_info["status"], "Invalid")
+        self.assertEqual(collections["nfc_charge_requests"].insert_calls, [])
+
+    async def test_status_notification_covers_connector_operational_states(self):
+        state_cases = (
+            ("Available", "disponible"),
+            ("Charging", "ocupado"),
+            ("Occupied", "ocupado"),
+            ("Preparing", "ocupado"),
+            ("SuspendedEV", "ocupado"),
+            ("SuspendedEVSE", "ocupado"),
+            ("Finishing", "ocupado"),
+            ("Reserved", "ocupado"),
+            ("Faulted", "falla"),
+            ("Unavailable", "fuera_de_servicio"),
+        )
+
+        for connector_status, expected_general_state in state_cases:
+            with self.subTest(
+                connector_status=connector_status,
+                expected_general_state=expected_general_state,
+            ):
+                charger = Mock()
+                charger.find_one = AsyncMock(return_value=None)
+                charger.update_one = AsyncMock(
+                    return_value=SimpleNamespace(matched_count=1)
+                )
+                events = Mock()
+                events.insert_one = AsyncMock()
+                collections = {
+                    "cargadores": charger,
+                    "eventos_ocpp": events,
+                    "status_notifications": Mock(insert_one=AsyncMock()),
+                    "logs": Mock(insert_one=AsyncMock()),
+                }
+                handler = ocpp_server.ChargePointHandler("CP-1", None)
+
+                with patch.object(
+                    ocpp_server,
+                    "get_collection",
+                    side_effect=collections.__getitem__,
+                ):
+                    response = await handler.on_status_notification(
+                        1,
+                        connector_status,
+                        "NoError",
+                    )
+
+                self.assertIsNotNone(response)
+                charger.update_one.assert_awaited_once()
+                update_pipeline = charger.update_one.await_args.args[1]
+                connector_expression = (
+                    update_pipeline[0]["$set"]["conectores"]["$let"]["in"]
+                    ["$cond"][2]["$concatArrays"][1]["$literal"][0]
+                )
+                self.assertEqual(
+                    connector_expression["estado"],
+                    connector_status,
+                )
+
+                state_switch = (
+                    update_pipeline[1]["$set"]["estado_general"]["$let"]["in"]
+                    ["$switch"]
+                )
+                branches = state_switch["branches"]
+                self.assertEqual(branches[0]["then"], "ocupado")
+                self.assertEqual(branches[1]["then"], "disponible")
+                self.assertEqual(branches[2]["then"], "falla")
+                self.assertEqual(branches[3]["then"], "fuera_de_servicio")
+                self.assertEqual(state_switch["default"], "fuera_de_servicio")
+
+                self.assertEqual(
+                    branches[1]["case"]["$in"],
+                    ["Available", "$$statuses"],
+                )
+                self.assertEqual(
+                    branches[2]["case"]["$in"],
+                    ["Faulted", "$$statuses"],
+                )
+                self.assertEqual(
+                    branches[3]["case"]["$in"],
+                    ["Unavailable", "$$statuses"],
+                )
+                occupied_statuses = set(
+                    branches[0]["case"]["$gt"][0]["$size"]
+                    ["$setIntersection"][1]
+                )
+                status_categories = {
+                    status: "ocupado" for status in occupied_statuses
+                }
+                status_categories.update({
+                    "Available": "disponible",
+                    "Faulted": "falla",
+                    "Unavailable": "fuera_de_servicio",
+                })
+                self.assertEqual(
+                    status_categories[connector_status],
+                    expected_general_state,
+                )
+                self.assertEqual(
+                    events.insert_one.await_args.args[0]["payload"]["status"],
+                    connector_status,
+                )
+
     async def test_status_notification_updates_connector_general_state_and_event(self):
         charger = Mock()
+        charger.find_one = AsyncMock(return_value=None)
         charger.update_one = AsyncMock(
             side_effect=[
                 SimpleNamespace(matched_count=1),
@@ -2621,6 +4619,20 @@ async def connect_ocpp(websocket, charge_point_id):
 
 
 class OCPPAdmissionTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        settings_patch = patch.object(
+            ocpp_server,
+            "get_ocpp_protocol_settings",
+            new_callable=AsyncMock,
+            return_value=SimpleNamespace(
+                enabled_protocols=["ocpp1.6", "ocpp2.0.1", "ocpp2.1"],
+                automatic_detection=True,
+                preferred_protocol="ocpp1.6",
+            ),
+        )
+        settings_patch.start()
+        self.addCleanup(settings_patch.stop)
+
     def assert_connection_cleaned(self, charge_point_id, manager=None):
         manager = manager or ocpp_server.ocpp_connection_manager
         self.assertNotIn(charge_point_id, manager.pending_connections)
@@ -2753,17 +4765,20 @@ class OCPPAdmissionTests(unittest.IsolatedAsyncioTestCase):
             "charge_point_id": charge_point_id,
             "activo": True,
         })
-        websocket = FakeWebSocket(protocols="chat, unknown")
+        for protocols in ("chat, unknown", "ocpp2.2"):
+            websocket = FakeWebSocket(protocols=protocols)
 
-        with patch.object(ocpp_server, "get_collection", return_value=charger):
-            await connect_ocpp(websocket, charge_point_id)
+            with self.subTest(protocols=protocols), patch.object(
+                ocpp_server, "get_collection", return_value=charger
+            ):
+                await connect_ocpp(websocket, charge_point_id)
 
-        self.assertEqual(websocket.accept_calls, [])
-        self.assertEqual(websocket.close_calls[0][0], 1008)
+            self.assertEqual(websocket.accept_calls, [])
+            self.assertEqual(websocket.close_calls[0][0], 1008)
         self.assertEqual(charger.update_calls, [])
         self.assert_connection_cleaned(charge_point_id)
 
-    async def test_connection_using_ocpp_16_without_j_is_rejected(self):
+    async def test_connection_using_standard_ocpp_16_subprotocol_is_accepted(self):
         charge_point_id = f"CP-{uuid4().hex}"
         charger = FakeChargerCollection({
             "charge_point_id": charge_point_id,
@@ -2771,12 +4786,20 @@ class OCPPAdmissionTests(unittest.IsolatedAsyncioTestCase):
         })
         websocket = FakeWebSocket(protocols="ocpp1.6")
 
-        with patch.object(ocpp_server, "get_collection", return_value=charger):
+        with (
+            patch.object(ocpp_server, "get_collection", return_value=charger),
+            patch.object(
+                ocpp_server.ChargePointHandler,
+                "start",
+                new_callable=AsyncMock,
+            ),
+            patch("builtins.print"),
+        ):
             await connect_ocpp(websocket, charge_point_id)
 
-        self.assertEqual(websocket.accept_calls, [])
-        self.assertEqual(websocket.close_calls[0][0], 1008)
-        self.assertEqual(charger.update_calls, [])
+        self.assertEqual(websocket.accept_calls, ["ocpp1.6"])
+        self.assertEqual(websocket.close_calls, [])
+        self.assertEqual(charger.document["subprotocolo_ocpp"], "ocpp1.6")
         self.assert_connection_cleaned(charge_point_id)
 
     async def test_connection_using_uppercase_ocpp_subprotocol_is_rejected(self):
@@ -3178,6 +5201,20 @@ class OCPPAdmissionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class OCPPSessionConnectionLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        settings_patch = patch.object(
+            ocpp_server,
+            "get_ocpp_protocol_settings",
+            new_callable=AsyncMock,
+            return_value=SimpleNamespace(
+                enabled_protocols=["ocpp1.6", "ocpp2.0.1", "ocpp2.1"],
+                automatic_detection=True,
+                preferred_protocol="ocpp1.6",
+            ),
+        )
+        settings_patch.start()
+        self.addCleanup(settings_patch.stop)
+
     def _boot_collections(self, charger, sessions, events=None):
         return {
             "cargadores": charger,
@@ -3642,6 +5679,24 @@ class MeterValuesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session["energia_consumida_kwh"], 0.5)
         self.assertEqual(session["potencia_maxima_kw"], 1.2)
         self.assertEqual(update["$max"], {"potencia_maxima_kw": 1.2})
+
+    async def test_new_meter_and_telemetry_records_inherit_session_company(self):
+        company_id = ObjectId()
+        session = active_session()
+        session["empresa_id"] = company_id
+        collections = self._collections(session)
+
+        await self._send_meter_values(collections)
+
+        self.assertEqual(
+            collections["meter_values"].insert_calls[0]["empresa_id"],
+            company_id,
+        )
+        self.assertTrue(collections["telemetria"].insert_calls)
+        self.assertTrue(all(
+            item["empresa_id"] == company_id
+            for item in collections["telemetria"].insert_calls
+        ))
 
     async def test_transaction_owned_by_another_charger_is_not_updated(self):
         session = active_session(charge_point_id="CP-OTHER")

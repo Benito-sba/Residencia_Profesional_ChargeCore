@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Annotated, Optional, List
+from typing import Annotated, Literal, Optional, List
 from pydantic import BaseModel, Field, StringConstraints
 from bson import ObjectId
 from .user import PyObjectId
@@ -17,6 +17,7 @@ class CargadorBase(BaseModel):
     charge_point_id: str = Field(..., min_length=1, max_length=50)
     nombre: str = Field(..., min_length=1, max_length=100)
     ubicacion: str
+    ocpp_version: Literal["ocpp1.6", "ocpp2.0.1", "ocpp2.1"] = "ocpp1.6"
     conectores: List[Conector] = []
     estado_general: str = Field(default="disponible", pattern="^(disponible|ocupado|mantenimiento|fuera_de_servicio)$")
     firmware_version: Optional[str] = None
@@ -28,6 +29,7 @@ class CargadorBase(BaseModel):
 
 class CargadorCreate(CargadorBase):
     ocpp_password: str = Field(..., min_length=12, max_length=128)
+    empresa_id: Optional[PyObjectId] = None
 
 
 class OCPPPasswordUpdate(BaseModel):
@@ -42,9 +44,11 @@ class CargadorUpdate(BaseModel):
     modelo: Optional[str] = None
     fabricante: Optional[str] = None
     activo: Optional[bool] = None
+    empresa_id: Optional[PyObjectId] = None
 
 class CargadorResponse(CargadorBase):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
+    empresa_id: Optional[PyObjectId] = None
     sesion_actual: Optional[dict] = None
 
     class Config:

@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 from .user import PyObjectId
 
@@ -20,6 +20,26 @@ class ClientProfileResponse(BaseModel):
         populate_by_name = True
         json_encoders = {PyObjectId: str}
         arbitrary_types_allowed = True
+
+
+class ClientProfileUpdate(BaseModel):
+    nombre: Optional[str] = Field(default=None, min_length=2, max_length=100)
+    telefono: Optional[str] = Field(default=None, max_length=30)
+
+    @field_validator("nombre", mode="before")
+    @classmethod
+    def normalize_name(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("telefono", mode="before")
+    @classmethod
+    def normalize_phone(cls, value):
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    class Config:
+        extra = "ignore"
 
 
 class ClientVehicleCreate(BaseModel):
@@ -67,6 +87,14 @@ class ClientSessionVehicle(BaseModel):
     marca: str
     modelo: str
     placa: Optional[str] = None
+    tipo_conector: Optional[str] = None
+
+
+class ClientSessionReward(BaseModel):
+    nombre: Optional[str] = None
+    empresa: Optional[str] = None
+    descripcion: Optional[str] = None
+    condiciones: Optional[str] = None
 
 
 class ClientSessionResponse(BaseModel):
@@ -78,9 +106,12 @@ class ClientSessionResponse(BaseModel):
     fecha_inicio: Optional[datetime] = None
     fecha_fin: Optional[datetime] = None
     energia_consumida_kwh: Optional[float] = None
+    potencia_promedio_kw: Optional[float] = None
     duracion_minutos: Optional[int] = None
     estado: Optional[str] = None
+    motivo_fin: Optional[str] = None
     beneficio_aplicado: Optional[str] = None
+    recompensa: Optional[ClientSessionReward] = None
 
 
 class ClientActiveSessionVehicle(BaseModel):
@@ -113,6 +144,15 @@ class ClientActiveSessionEnvelope(BaseModel):
 class ClientStartChargeRequest(BaseModel):
     vehicle_id: str
     connector_id: int = Field(..., ge=1)
+
+
+class ClientQRChargeRequest(BaseModel):
+    charge_point_id: str = Field(..., min_length=1, max_length=50)
+
+    @field_validator("charge_point_id", mode="before")
+    @classmethod
+    def normalize_charge_point_id(cls, value):
+        return value.strip() if isinstance(value, str) else value
 
 
 class ClientRewardSelectionRequest(BaseModel):

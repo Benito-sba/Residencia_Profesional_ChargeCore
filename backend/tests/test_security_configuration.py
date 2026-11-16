@@ -23,6 +23,8 @@ from app.main import app as chargecore_app
 from app.routers import auth as auth_router
 import init_db
 
+ATLAS_TEST_URI = "mongodb+srv://cluster.mongodb.net/csms_crode"
+
 
 class JWTConfigurationTests(unittest.TestCase):
     def test_secret_key_is_required_and_loaded_from_environment(self):
@@ -41,7 +43,11 @@ class JWTConfigurationTests(unittest.TestCase):
     def test_short_secret_key_is_rejected_without_echoing_its_value(self):
         short_key = secrets.token_urlsafe(4)
         with self.assertRaises(RuntimeError) as raised:
-            Settings(SECRET_KEY=short_key, _env_file=None)
+            Settings(
+                SECRET_KEY=short_key,
+                MONGODB_URL=ATLAS_TEST_URI,
+                _env_file=None,
+            )
 
         self.assertNotIn(short_key, str(raised.exception))
 
@@ -59,16 +65,9 @@ class JWTConfigurationTests(unittest.TestCase):
             jwt.decode(token, other_key, algorithms=[settings.ALGORITHM])
 
     def test_production_database_uri_requires_tls(self):
-        with self.assertRaisesRegex(RuntimeError, "TLS"):
-            Settings(
-                SECRET_KEY=secrets.token_urlsafe(48),
-                DEBUG=False,
-                MONGODB_URL="mongodb://db.example:27017/csms",
-                _env_file=None,
-            )
         for uri in (
-            "mongodb+srv://db.example/csms?tls=false",
-            "mongodb://db.example:27017/csms?tls=true&tlsInsecure=true",
+            "mongodb+srv://db.mongodb.net/csms?tls=false",
+            "mongodb+srv://db.mongodb.net/csms?tls=true&tlsInsecure=true",
         ):
             with self.subTest(uri=uri):
                 with self.assertRaisesRegex(RuntimeError, "TLS"):
@@ -82,10 +81,36 @@ class JWTConfigurationTests(unittest.TestCase):
         secure_settings = Settings(
             SECRET_KEY=secrets.token_urlsafe(48),
             DEBUG=False,
-            MONGODB_URL="mongodb+srv://db.example/csms",
+            MONGODB_URL="mongodb+srv://db.mongodb.net/csms",
             _env_file=None,
         )
         self.assertFalse(secure_settings.DEBUG)
+
+    def test_database_uri_is_required_and_must_point_to_atlas(self):
+        secret_key = secrets.token_urlsafe(48)
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(ValidationError):
+                Settings(SECRET_KEY=secret_key, _env_file=None)
+
+        for uri in (
+            "mongodb://localhost:27017/csms_crode",
+            "mongodb://127.0.0.1:27017/csms_crode",
+            "mongodb+srv://cluster.example.com/csms_crode",
+        ):
+            with self.subTest(uri_scheme=uri.split(":", 1)[0]):
+                with self.assertRaisesRegex(RuntimeError, "MongoDB Atlas"):
+                    Settings(
+                        SECRET_KEY=secret_key,
+                        MONGODB_URL=uri,
+                        _env_file=None,
+                    )
+
+        configuration = Settings(
+            SECRET_KEY=secret_key,
+            MONGODB_URL=ATLAS_TEST_URI,
+            _env_file=None,
+        )
+        self.assertEqual(configuration.MONGODB_URL, ATLAS_TEST_URI)
 
 
 class ActiveAccountAuthenticationTests(unittest.IsolatedAsyncioTestCase):
@@ -140,6 +165,7 @@ class CorsConfigurationTests(unittest.TestCase):
     def test_configured_origin_is_allowed_and_other_origin_is_rejected(self):
         configuration = Settings(
             SECRET_KEY=secrets.token_urlsafe(48),
+            MONGODB_URL=ATLAS_TEST_URI,
             CORS_ORIGINS="http://localhost:8501",
             _env_file=None,
         )
@@ -156,6 +182,7 @@ class CorsConfigurationTests(unittest.TestCase):
     def test_empty_cors_setting_allows_no_cross_origin_requests(self):
         configuration = Settings(
             SECRET_KEY=secrets.token_urlsafe(48),
+            MONGODB_URL=ATLAS_TEST_URI,
             CORS_ORIGINS="",
             _env_file=None,
         )
@@ -173,6 +200,7 @@ class CorsConfigurationTests(unittest.TestCase):
                 with self.assertRaises(ValidationError):
                     Settings(
                         SECRET_KEY=secrets.token_urlsafe(48),
+                        MONGODB_URL=ATLAS_TEST_URI,
                         CORS_ORIGINS=origins,
                         _env_file=None,
                     )
@@ -313,7 +341,7 @@ class InitialAdminProvisioningTests(unittest.TestCase):
 
 
 class LoginCompatibilityTests(unittest.TestCase):
-    def test_login_response_remains_compatible_with_streamlit(self):
+    def test_login_response_preserves_the_api_contract(self):
         password = secrets.token_urlsafe(18)
         user = {
             "_id": ObjectId(),

@@ -1,7 +1,6 @@
 import requests
-import streamlit as st
 
-from utils.state import default_api_base_url
+from utils.api_config import default_api_base_url
 
 LOGIN_CONNECTION_ERROR = "No se pudo conectar con el servidor. Verifica que el sistema esté disponible."
 LOGIN_INVALID_CREDENTIALS = "El correo o la contraseña son incorrectos."
@@ -9,6 +8,12 @@ LOGIN_INACTIVE_USER = "El usuario está inactivo. Contacta al administrador del 
 LOGIN_UNEXPECTED_RESPONSE = "El servidor devolvió una respuesta inesperada. Intenta nuevamente."
 ERROR_CONNECTION = "No fue posible conectar con el servidor."
 ERROR_INTERNAL = "Ocurrió un error inesperado. Intenta nuevamente."
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 10
+OCPP_COMMAND_TIMEOUT_SECONDS = 40
+OCPP_COMMAND_UNCERTAIN_ERROR = (
+    "La orden excedió el tiempo de espera. Su resultado es incierto; "
+    "verifica el estado del cargador antes de volver a intentarlo."
+)
 
 
 def _friendly_validation_error(detail):
@@ -70,35 +75,66 @@ def _error_result(response):
         "_status_code": response.status_code,
     }
 
-def get_base_url():
-    return st.session_state.get("api_base_url", default_api_base_url()).rstrip("/")
+def get_base_url(base_url=None):
+    if base_url:
+        return base_url.rstrip("/")
+    return default_api_base_url().rstrip("/")
 
-def get_headers():
-    token = st.session_state.get("token")
+def get_headers(token=None):
     return {"Authorization": f"Bearer {token}"} if token else {}
 
-def api_get(endpoint, params=None):
+def api_get(endpoint, params=None, *, token=None, base_url=None):
     try:
-        response = requests.get(f"{get_base_url()}{endpoint}", headers=get_headers(), params=params, timeout=10)
+        response = requests.get(
+            f"{get_base_url(base_url)}{endpoint}",
+            headers=get_headers(token),
+            params=params,
+            timeout=10,
+        )
         return response.json() if response.status_code == 200 else _error_result(response)
     except Exception as error:
         return {"error": _friendly_exception(error)}
 
-def api_post(endpoint, data=None, json=None):
+def api_post(
+    endpoint,
+    data=None,
+    json=None,
+    *,
+    token=None,
+    base_url=None,
+    timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS,
+):
     try:
         if endpoint == "/auth/login" and data:
-            response = requests.post(f"{get_base_url()}{endpoint}", data=data, timeout=10)
+            response = requests.post(
+                f"{get_base_url(base_url)}{endpoint}", data=data, timeout=10
+            )
         else:
-            response = requests.post(f"{get_base_url()}{endpoint}", headers=get_headers(), data=data, json=json, timeout=10)
+            response = requests.post(
+                f"{get_base_url(base_url)}{endpoint}",
+                headers=get_headers(token),
+                data=data,
+                json=json,
+                timeout=timeout,
+            )
+        if response.status_code == 504 and timeout >= OCPP_COMMAND_TIMEOUT_SECONDS:
+            return {
+                "error": OCPP_COMMAND_UNCERTAIN_ERROR,
+                "_status_code": response.status_code,
+            }
         return response.json() if response.status_code in [200, 201] else _error_result(response)
+    except requests.Timeout:
+        if timeout >= OCPP_COMMAND_TIMEOUT_SECONDS:
+            return {"error": OCPP_COMMAND_UNCERTAIN_ERROR}
+        return {"error": ERROR_CONNECTION}
     except Exception as error:
         return {"error": _friendly_exception(error)}
 
 
-def api_login(username, password):
+def api_login(username, password, *, base_url=None):
     try:
         response = requests.post(
-            f"{get_base_url()}/auth/login",
+            f"{get_base_url(base_url)}/auth/login",
             data={"username": username, "password": password},
             timeout=10,
         )
@@ -124,17 +160,51 @@ def api_login(username, password):
 
     return result
 
-def api_put(endpoint, json=None):
+def api_put(endpoint, json=None, *, token=None, base_url=None):
     try:
-        response = requests.put(f"{get_base_url()}{endpoint}", headers=get_headers(), json=json, timeout=10)
+        response = requests.put(
+            f"{get_base_url(base_url)}{endpoint}",
+            headers=get_headers(token),
+            json=json,
+            timeout=10,
+        )
         return response.json() if response.status_code == 200 else _error_result(response)
     except Exception as error:
         return {"error": _friendly_exception(error)}
 
-def api_delete(endpoint):
+def api_delete(endpoint, *, token=None, base_url=None):
     try:
-        response = requests.delete(f"{get_base_url()}{endpoint}", headers=get_headers(), timeout=10)
+        response = requests.delete(
+            f"{get_base_url(base_url)}{endpoint}",
+            headers=get_headers(token),
+            timeout=10,
+        )
         return response.json() if response.status_code == 200 else _error_result(response)
+    except Exception as error:
+        return {"error": _friendly_exception(error)}
+
+
+def api_download(endpoint, params=None, *, token=None, base_url=None):
+    try:
+        response = requests.get(
+            f"{get_base_url(base_url)}{endpoint}",
+            headers=get_headers(token),
+            params=params,
+            timeout=30,
+        )
+        if response.status_code != 200:
+            return _error_result(response)
+        disposition = response.headers.get("Content-Disposition", "")
+        filename = "reporte"
+        if "filename=" in disposition:
+            filename = disposition.split("filename=", 1)[1].strip().strip('"')
+        return {
+            "content": response.content,
+            "filename": filename,
+            "content_type": response.headers.get(
+                "Content-Type", "application/octet-stream"
+            ),
+        }
     except Exception as error:
         return {"error": _friendly_exception(error)}
 

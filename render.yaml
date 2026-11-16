@@ -13,7 +13,7 @@ services:
       - key: SECRET_KEY
         generateValue: true
       - key: MONGODB_URL
-        value: mongodb+srv://santiagobaacevedi425_db_user:0ZpQm6sMgpZbA22a@csms-crode.gn4ofsn.mongodb.net/csms_crode?retryWrites=true&w=majority
+        sync: false
       - key: DATABASE_NAME
         value: csms_crode
       - key: DEBUG
@@ -27,10 +27,12 @@ services:
     plan: free
     rootDir: frontend
     buildCommand: pip install -r requirements.txt
-    startCommand: streamlit run app.py --server.address 0.0.0.0 --server.port $PORT --server.headless true
+    startCommand: python nicegui_app.py
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.10
+      - key: NICEGUI_STORAGE_SECRET
+        generateValue: true
       - key: CHARGECORE_API_URL
         fromService:
           type: web

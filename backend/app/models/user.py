@@ -1,8 +1,13 @@
 from datetime import datetime
 from typing import Optional
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field, EmailStr, model_validator
 from pydantic_core import core_schema
 from bson import ObjectId
+
+LEGACY_ROLES = frozenset({"admin", "operador", "consulta", "cliente"})
+NEW_ROLES = frozenset({"superadmin", "dueno_empresa"})
+ALL_ROLES_PATTERN = "^(admin|operador|consulta|cliente|superadmin|dueno_empresa)$"
+
 
 class PyObjectId(ObjectId):
     @classmethod
@@ -26,19 +31,40 @@ class UsuarioBase(BaseModel):
     email: EmailStr
     telefono: Optional[str] = None
     activo: bool = True
-    rol: str = Field(..., pattern="^(admin|operador|consulta|cliente)$")
+    rol: str = Field(..., pattern=ALL_ROLES_PATTERN)
+    empresa_id: Optional[PyObjectId] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    @model_validator(mode="after")
+    def validate_company_role(self):
+        if self.rol == "superadmin" and self.empresa_id is not None:
+            raise ValueError("El superadministrador no puede pertenecer a una empresa")
+        if self.rol == "dueno_empresa" and self.empresa_id is None:
+            raise ValueError("El dueño de empresa debe tener una empresa asignada")
+        return self
+
 
 class UsuarioCreate(UsuarioBase):
     password: str = Field(..., min_length=6)
+
 
 class UsuarioUpdate(BaseModel):
     nombre: Optional[str] = None
     email: Optional[EmailStr] = None
     telefono: Optional[str] = None
     activo: Optional[bool] = None
-    rol: Optional[str] = Field(default=None, pattern="^(admin|operador|consulta|cliente)$")
+    rol: Optional[str] = Field(default=None, pattern=ALL_ROLES_PATTERN)
+    empresa_id: Optional[PyObjectId] = None
     password: Optional[str] = Field(default=None, min_length=6)
+
+    @model_validator(mode="after")
+    def validate_company_role(self):
+        if self.rol == "superadmin" and self.empresa_id is not None:
+            raise ValueError("El superadministrador no puede pertenecer a una empresa")
+        if self.rol == "dueno_empresa" and self.empresa_id is None:
+            raise ValueError("El dueño de empresa debe tener una empresa asignada")
+        return self
+
 
 class UsuarioResponse(UsuarioBase):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")

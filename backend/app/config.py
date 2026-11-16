@@ -1,6 +1,7 @@
 from functools import lru_cache
 import ipaddress
 import re
+from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs, urlsplit
 
@@ -11,22 +12,53 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     APP_NAME: str = "CSMS CRODE Mérida"
     DEBUG: bool = True
-    MONGODB_URL: str = "mongodb://localhost:27017"
+    MONGODB_URL: str = Field(..., min_length=1)
     DATABASE_NAME: str = "csms_crode"
-    SUPABASE_URL: Optional[str] = None
-    SUPABASE_SECRET_KEY: Optional[SecretStr] = Field(default=None, repr=False)
     SECRET_KEY: SecretStr = Field(..., repr=False)
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 480
     OCPP_COMMAND_TIMEOUT_SECONDS: float = 30.0
     CORS_ORIGINS: str = ""
+    SMTP_HOST: Optional[str] = None
+    SMTP_PORT: int = 587
+    SMTP_STARTTLS: bool = True
+    SMTP_USE_SSL: bool = False
+    SMTP_USERNAME: Optional[str] = None
+    SMTP_PASSWORD: Optional[SecretStr] = Field(default=None, repr=False)
+    SMTP_FROM_EMAIL: Optional[str] = None
+
+    @property
+    def smtp_configured(self) -> bool:
+        return bool(
+            self.SMTP_HOST
+            and self.SMTP_FROM_EMAIL
+            and (
+                not self.SMTP_USERNAME
+                or self.SMTP_PASSWORD is not None
+            )
+        )
 
     @model_validator(mode="after")
     def validate_secret_key(self):
         if len(self.SECRET_KEY.get_secret_value()) < 32:
             raise RuntimeError("SECRET_KEY debe tener al menos 32 caracteres")
-        if not self.DEBUG:
+        try:
             parsed = urlsplit(self.MONGODB_URL)
+            hostname = parsed.hostname
+        except ValueError as error:
+            raise RuntimeError(
+                "MONGODB_URL debe ser una URI válida de MongoDB Atlas"
+            ) from error
+        if (
+            parsed.scheme != "mongodb+srv"
+            or not hostname
+            or not hostname.lower().endswith(".mongodb.net")
+        ):
+            raise RuntimeError(
+                "MONGODB_URL debe apuntar a un clúster de MongoDB Atlas "
+                "con esquema mongodb+srv"
+            )
+        if not self.DEBUG:
             options = {
                 key.lower(): values
                 for key, values in parse_qs(parsed.query).items()
@@ -120,7 +152,7 @@ class Settings(BaseSettings):
         return self.CORS_ORIGINS.split(",")
 
     class Config:
-        env_file = ".env"
+        env_file = Path(__file__).resolve().parents[1] / ".env"
 
 
 @lru_cache()

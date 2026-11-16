@@ -10,8 +10,7 @@ from pymongo.errors import PyMongoError
 
 from app.config import settings
 from app.database import connect_db, close_db, db
-from app.supabase_database import connect_supabase
-from app.routers import auth, users, vehicles, nfc_cards, chargers, sessions, rewards, reports, dashboard, monitoring, client_portal
+from app.routers import auth, users, vehicles, nfc_cards, chargers, sessions, rewards, reports, dashboard, monitoring, client_portal, ocpp_settings, companies, commercial_benefits, company_rewards
 from app.websocket.diagnostics import OCPPWebSocketDiagnosticsMiddleware
 from app.websocket.ocpp_server import ocpp_endpoint
 
@@ -19,13 +18,12 @@ from app.websocket.ocpp_server import ocpp_endpoint
 async def lifespan(app: FastAPI):
     try:
         await connect_db()
-        connect_supabase()
         yield
     finally:
         await close_db()
 
 app = FastAPI(
-    title="ChargeCore - API OCPP 1.6J",
+    title="ChargeCore - API OCPP",
     description="Plataforma para el Control y Monitoreo de Sistemas de Carga de Vehiculos Electricos",
     version="1.0.0",
     lifespan=lifespan
@@ -48,10 +46,15 @@ app.include_router(nfc_cards.router)
 app.include_router(chargers.router)
 app.include_router(sessions.router)
 app.include_router(rewards.router)
+app.include_router(commercial_benefits.router)
+app.include_router(company_rewards.router)
+app.include_router(company_rewards.client_router)
 app.include_router(reports.router)
 app.include_router(dashboard.router)
 app.include_router(monitoring.router)
 app.include_router(client_portal.router)
+app.include_router(ocpp_settings.router)
+app.include_router(companies.router)
 
 # Ruta WebSocket OCPP para los cargadores
 @app.websocket("/ocpp/{charge_point_id}")
@@ -61,7 +64,7 @@ async def websocket_ocpp(websocket: WebSocket, charge_point_id: str):
 @app.get("/")
 async def root():
     return {
-        "message": "ChargeCore - API OCPP 1.6J",
+        "message": "ChargeCore - API OCPP",
         "version": "1.0.0",
         "status": "operativo"
     }

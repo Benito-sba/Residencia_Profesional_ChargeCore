@@ -59,11 +59,13 @@ class MemoryCollection:
 class ClientRewardSelectionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.user_id = ObjectId()
+        self.company_id = ObjectId()
         self.session_id = ObjectId()
         self.reward_id = ObjectId()
         self.session = {
             "_id": self.session_id,
             "usuario_id": self.user_id,
+            "empresa_id": self.company_id,
             "estado": "activa",
         }
         self.reward = {
@@ -89,7 +91,11 @@ class ClientRewardSelectionTests(unittest.IsolatedAsyncioTestCase):
             return await client_portal.select_client_reward(
                 str(self.session_id),
                 ClientRewardSelectionRequest(reward_id=reward_id),
-                current_user={"_id": self.user_id, "rol": "cliente"},
+                current_user={
+                    "_id": self.user_id,
+                    "empresa_id": self.company_id,
+                    "rol": "cliente",
+                },
             )
 
     async def test_selection_reserves_reward_for_owned_active_session(self):

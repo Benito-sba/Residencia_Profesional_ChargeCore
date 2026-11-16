@@ -23,6 +23,7 @@ class NFCCardUpdate(BaseModel):
 
 class NFCCardResponse(NFCCardBase):
     id: PyObjectId = Field(default_factory=PyObjectId, alias="_id")
+    empresa_id: Optional[PyObjectId] = None
 
     class Config:
         populate_by_name = True

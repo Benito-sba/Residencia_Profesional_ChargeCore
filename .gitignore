@@ -13,10 +13,20 @@ __pycache__/
 .env
 .env.*
 !.env.example
-.streamlit/secrets.toml
+# Archivos de limpieza de secretos — NUNCA commitear
+secrets.txt
+.secrets/
 
 # Editor and operating-system files
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Local NiceGUI session storage can contain authentication tokens
+/.nicegui/
+/frontend/.nicegui/
+
+# Archivos de limpieza de secretos - NUNCA commitear
+secrets.txt
+.secrets/
