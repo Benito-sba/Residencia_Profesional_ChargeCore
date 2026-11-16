@@ -1,12 +1,41 @@
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, PropertyMock, patch
 
 from pages import nicegui_admin
 
 
 class NiceGuiAdminTests(unittest.TestCase):
+    def test_table_edit_callbacks_open_dialogs_in_page_layout(self):
+        record = {"_id": "user-1"}
+        layout = MagicMock()
+        client = SimpleNamespace(layout=layout)
+
+        with (
+            patch.object(
+                type(nicegui_admin.context),
+                "client",
+                new_callable=PropertyMock,
+                return_value=client,
+            ),
+            patch.object(nicegui_admin, "_edit_record") as edit_record,
+        ):
+            for page_key in ("usuarios", "vehiculos", "tarjetas"):
+                callback = nicegui_admin._edit_record_callback(
+                    page_key,
+                    record,
+                    "token",
+                    "http://api.test/api",
+                )
+                callback()
+
+        self.assertEqual(layout.__enter__.call_count, 3)
+        self.assertEqual(
+            [call.args[0] for call in edit_record.call_args_list],
+            ["usuarios", "vehiculos", "tarjetas"],
+        )
+
     def test_company_search_matches_name_and_contact_fields(self):
         companies = [
             {

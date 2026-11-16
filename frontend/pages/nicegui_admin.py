@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta, timezone
 from threading import Lock
 from urllib.parse import quote, urlsplit
 
-from nicegui import app, ui
+from nicegui import app, context, ui
 
 from components.nicegui_layout import add_nicegui_styles, render_header, render_sidebar
 from pages.client_page_utils import page_container, render_page_heading, show_error
@@ -908,6 +908,14 @@ def _edit_record(page_key, record, token, api_base_url):
                 "no-caps"
             ).classes("chargecore-primary bg-[#ff500a] text-white")
     dialog.open()
+
+
+def _edit_record_callback(page_key, record, token, api_base_url):
+    def open_edit_dialog():
+        with context.client.layout:
+            _edit_record(page_key, record, token, api_base_url)
+
+    return open_edit_dialog
 
 
 def _deactivate_record(page_key, record, token, api_base_url):
@@ -2132,9 +2140,9 @@ def _render_users_records(rows, token, api_base_url):
                                         ).classes("cc-users-action-menu"):
                                             ui.menu_item(
                                                 "Editar",
-                                                on_click=lambda selected=record: _edit_record(
+                                                on_click=_edit_record_callback(
                                                     "usuarios",
-                                                    selected,
+                                                    record,
                                                     token,
                                                     api_base_url,
                                                 ),
@@ -2687,9 +2695,9 @@ def _render_registry_records(page_key, rows, token, api_base_url):
                                         ).classes("cc-registry-action-menu"):
                                             ui.menu_item(
                                                 "Editar",
-                                                on_click=lambda selected=record: _edit_record(
+                                                on_click=_edit_record_callback(
                                                     page_key,
-                                                    selected,
+                                                    record,
                                                     token,
                                                     api_base_url,
                                                 ),
