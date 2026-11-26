@@ -12,7 +12,7 @@ def render_sidebar(user, active_page):
     color_theme = app.storage.user.get("color_theme", "auto")
 
     drawer = ui.left_drawer(value=False).props(
-        f"show-if-above width={80 if sidebar_collapsed else 312} breakpoint=320"
+        f"show-if-above width={80 if sidebar_collapsed else 312} breakpoint=820"
     ).classes(
         "chargecore-drawer"
         + (" chargecore-drawer-collapsed" if sidebar_collapsed else "")

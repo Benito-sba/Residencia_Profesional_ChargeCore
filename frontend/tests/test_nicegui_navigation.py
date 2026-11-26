@@ -1,8 +1,10 @@
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 import nicegui_app
+from components import nicegui_layout
 from components.navigation import (
     NAVIGATION_GROUPS,
     PAGE_MODULES,
@@ -12,6 +14,53 @@ from components.navigation import (
 
 
 class NiceGuiNavigationTests(unittest.TestCase):
+    def test_sidebar_uses_an_overlay_on_mobile_widths(self):
+        drawer = MagicMock()
+        ui_factories = (
+            "row",
+            "column",
+            "element",
+            "icon",
+            "label",
+            "button",
+            "tooltip",
+            "dialog",
+            "card",
+            "input",
+            "separator",
+            "avatar",
+            "menu",
+            "select",
+        )
+        with (
+            patch.object(
+                type(nicegui_layout.app.storage),
+                "user",
+                new_callable=PropertyMock,
+                return_value={},
+            ),
+            patch.object(
+                nicegui_layout.ui,
+                "left_drawer",
+                return_value=drawer,
+            ) as left_drawer,
+            ExitStack() as stack,
+        ):
+            for factory in ui_factories:
+                stack.enter_context(
+                    patch.object(
+                        nicegui_layout.ui,
+                        factory,
+                        return_value=MagicMock(),
+                    )
+                )
+            nicegui_layout.render_sidebar({"rol": "cliente"}, "inicio")
+
+        self.assertIn(
+            "breakpoint=820",
+            left_drawer.return_value.props.call_args.args[0],
+        )
+
     def test_only_current_roles_have_navigation(self):
         self.assertEqual(
             set(ROLE_PAGE_KEYS),
